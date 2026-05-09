@@ -1,0 +1,24 @@
+# OpenClaw runtime state — 머신별, 절대 비공개
+.openclaw/
+state/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 로컬 환경변수 / 비밀
+.env
+.env.local
+credentials*.json
+client_secret*.json
+
+# 안전망: skill에서 _attachments 등 임시 디렉토리 생성 시
+**/_attachments/
+**/_tmp/
