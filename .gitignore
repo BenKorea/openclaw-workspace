@@ -1,5 +1,6 @@
 # OpenClaw runtime state — 머신별, 절대 비공개
-.openclaw/
+.openclaw/*
+!.openclaw/workspace-state.json
 state/
 
 # Python bytecode
