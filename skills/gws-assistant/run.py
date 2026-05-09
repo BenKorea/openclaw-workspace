@@ -4,7 +4,7 @@
 운영 모델 (Phase 1, 3분류 확정 2026-05-08):
     - cron 이 평일 10분 간격으로 본 스크립트를 폴링
     - 게이트(평일/근무시간/공휴일/미팅 중-`판독`예외) 통과 + plan 변경 시 발화
-    - 발화 = unread 전부의 3분류(진행·보류·불필요) plan + Telegram 메시지 + 승인 명령 안내
+    - 발화 = 받은편지함 미분류 메일(라벨 없음, 읽음/안읽음 무관) 3분류(진행·보류·불필요) plan + Telegram 메시지 + 승인 명령 안내
     - 사용자는 Telegram 에서 /gws-assistant approve|cancel|snooze N 으로 응답
     - approve: pending plan 의 자동 처리 항목 실행 (모든 항목 라벨/archive)
     - cancel: pending plan 폐기 → 다음 폴링에서 재분류
@@ -14,10 +14,13 @@
 
 라벨 정책:
     라벨은 "콘텐츠 카테고리" 가 아니라 "브레인화 작업 진행 상태" 표시.
-    - 브레인화/진행 — audit 가치 있어 브레인화로 진행할 메일 (라벨 + archive)
+    - 브레인화/진행 — 노트 작성됨 + 후속 작업(회신/일정/할일) 진행 중. **임시 라벨**
+                    (followups 가 비어있지 않은 confirm 결과)
+    - 브레인화/완료 — 후속 작업까지 모두 종결. **영구 보존 (terminal)**
+                    (followups 가 비어있는 confirm 자동 진입 또는 `/g 완료 <id>` 수동 promote)
     - 브레인화/보류 — 외부 액션 대기 또는 분류 자신없음 (라벨, inbox 유지)
     - 브레인화/불필요 — 광고·자동알림·중복 등 브레인화 대상 아님 (라벨 + archive)
-    Legacy `브레인화/완료` / `브레인화/중복` 은 그대로 두고 unread 검색에서만 제외.
+    Legacy `브레인화/중복` 은 그대로 두고 inbox 검색에서만 제외.
 
 Usage:
     python3 run.py                  # cron 폴 (게이트 + 머지 + 발화)
@@ -53,6 +56,7 @@ ACCOUNT = "kimbi.kirams@gmail.com"
 KST = dt.timezone(dt.timedelta(hours=9), name="KST")
 
 STATE_PATH = pathlib.Path.home() / ".openclaw/agents/main/memory/gws-assistant.json"
+DETERMINISTIC_RULES_PATH = pathlib.Path.home() / ".openclaw/agents/main/memory/gws-deterministic.json"
 VAULT_ROOT = pathlib.Path.home() / "projects/2nd-brain-vault"
 VAULT_CAPTURE_DOC = VAULT_ROOT / "knowledge/02_areas/brain-system/workflows/gmail-capture.md"
 VAULT_INBOX = VAULT_ROOT / "sources/00_inbox"
@@ -68,7 +72,7 @@ HOLIDAY_CAL = "ko.south_korea#holiday@group.v.calendar.google.com"
 
 WORK_START = dt.time(8, 30)
 WORK_END = dt.time(17, 30)
-GMAIL_MAX = 10
+GMAIL_MAX = 5
 NOTIFIED_CAP = 1000
 
 BUSY_EXCEPTIONS = ["판독"]
@@ -94,10 +98,10 @@ NOISE_FROM_PATTERNS = [
 # 라벨 = "브레인화 작업 진행 상태", 콘텐츠 카테고리가 아님.
 LABEL_NOISE = "브레인화/불필요"
 LABEL_PENDING = "브레인화/보류"
-LABEL_PROCEED = "브레인화/진행"
+LABEL_PROCEED = "브레인화/진행"   # 노트 작성됨 + 후속 작업 (followups) 진행 중. 임시.
+LABEL_DONE = "브레인화/완료"      # 후속 작업까지 모두 종결. 영구 보존 (terminal).
 
-# Legacy 라벨 — 이미 부착된 메일은 그대로 두고 unread 검색에서만 제외 (마이그레이션 안 함).
-LEGACY_LABEL_COMPLETE = "브레인화/완료"
+# Legacy 라벨 — 이미 부착된 메일은 그대로 두고 inbox 검색에서만 제외.
 LEGACY_LABEL_DUPLICATE = "브레인화/중복"
 
 # LLM 분류는 3 카테고리로 출력:
@@ -191,9 +195,16 @@ def gog_call(*args: str, timeout: int = 30) -> tuple[bool, str]:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return (False, "timeout")
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
     if r.returncode != 0:
-        return (False, (r.stderr or r.stdout or "").strip())
-    return (True, (r.stdout or "").strip())
+        return (False, (err or out).strip())
+    # gog 가 googleapi 에러를 출력하면서도 exit 0 으로 끝내는 케이스 방어.
+    # 예: 'Invalid label' 등 → wrapper 에서 실패로 surface 해야 봇이 [확정 실패] 보고.
+    combined = f"{out}\n{err}".strip()
+    if "googleapi: Error" in combined:
+        return (False, combined)
+    return (True, out)
 
 
 # ============================================================================
@@ -281,12 +292,38 @@ def check_gates(now: dt.datetime) -> str | None:
 # Data fetch
 # ============================================================================
 
-def fetch_unread_all():
-    """unread + brainify 라벨(3-라벨 + legacy 2개) 어디에도 안 붙은 것만. archive 된 메일 제외 (in:inbox)."""
-    query = ("is:unread in:inbox "
+def fetch_inbox_pending():
+    """받은편지함에 있고 brainify 라벨(3-라벨 + legacy 2개) 어디에도 안 붙은 메일.
+    읽음/안읽음 무관 — 사용자가 Gmail 에서 직접 읽었지만 라벨이 없는 메일도 포함하여
+    blind spot 제거. Gmail 기본 정렬(최신순)을 그대로 사용."""
+    query = ("in:inbox "
              f"-label:{LABEL_NOISE} -label:{LABEL_PENDING} -label:{LABEL_PROCEED} "
-             f"-label:{LEGACY_LABEL_COMPLETE} -label:{LEGACY_LABEL_DUPLICATE}")
+             f"-label:{LABEL_DONE} -label:{LEGACY_LABEL_DUPLICATE}")
     items = gog_json("gmail", "search", query, "--max", str(GMAIL_MAX))
+    if items is None:
+        return None
+    if isinstance(items, dict):
+        items = items.get("messages", items.get("items", []))
+    return items or []
+
+
+def fetch_pending_labeled(limit: int = GMAIL_MAX):
+    """'브레인화/보류' 라벨 메일을 limit 건 가져온다 — pending-review 정리용.
+    in:inbox / archive 무관 (라벨만 보면 됨)."""
+    query = f"label:{LABEL_PENDING}"
+    items = gog_json("gmail", "search", query, "--max", str(limit))
+    if items is None:
+        return None
+    if isinstance(items, dict):
+        items = items.get("messages", items.get("items", []))
+    return items or []
+
+
+def fetch_in_progress_labeled(limit: int = GMAIL_MAX):
+    """'브레인화/진행' 라벨 메일을 limit 건 가져온다 — backlog 정리용.
+    archive 상태 무관 (이미 archive 됐을 가능성 높음)."""
+    query = f"label:{LABEL_PROCEED}"
+    items = gog_json("gmail", "search", query, "--max", str(limit))
     if items is None:
         return None
     if isinstance(items, dict):
@@ -318,19 +355,48 @@ def _vault_classification_guide() -> str:
 # Classifier (heuristic)
 # ============================================================================
 
-def classify_email_heuristic(m: dict) -> tuple[str, str]:
-    """from 주소 substring 매칭으로 noise 만 자동 식별. 그 외 pending.
-    빠른 path — LLM 호출 회피용."""
+def load_deterministic_rules() -> dict:
+    """학습된 deterministic 분류 규칙 (cmd_learn_rules 가 누적)."""
+    if not DETERMINISTIC_RULES_PATH.exists():
+        return {}
+    try:
+        return json.loads(DETERMINISTIC_RULES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_deterministic_rules(rules: dict) -> None:
+    DETERMINISTIC_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DETERMINISTIC_RULES_PATH.write_text(
+        json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def classify_email_heuristic(m: dict) -> tuple[str | None, str]:
+    """학습된 deterministic 규칙 우선 + 하드코딩 noise 패턴 fallback.
+    Returns (category, reason). category=None 이면 LLM 분류 필요."""
     frm_lower = (m.get("from") or "").lower()
+
+    # 1. 학습된 deterministic 규칙 (cmd_learn_rules 가 채움)
+    rules = load_deterministic_rules()
+    for pattern, info in rules.items():
+        if pattern.lower() in frm_lower:
+            cat = info.get("category", "pending")
+            if cat in VALID_CATEGORIES:
+                return (cat, f"학습 규칙 '{pattern}' ({info.get('source_corrections', '?')}회 누적)")
+
+    # 2. 하드코딩 noise 패턴
     for pattern in NOISE_FROM_PATTERNS:
         if pattern in frm_lower:
-            return ("noise", pattern)
-    return ("pending", "")
+            return ("noise", f"발신자 패턴 '{pattern}'")
+
+    return (None, "")
 
 
 def classify_emails_llm(emails: list[dict]) -> dict[str, tuple[str, str]]:
-    """LLM (claude haiku) 으로 batch 분류. 반환: {msg_id: (category, reason)}.
-    실패 시 빈 dict (호출자가 pending fallback)."""
+    """LLM (claude opus 4.7) 으로 batch 분류. 반환: {msg_id: (category, reason)}.
+    실패 시 빈 dict (호출자가 pending fallback).
+    confidence=low 응답은 안전하게 pending 으로 강등."""
     if not emails:
         return {}
 
@@ -343,12 +409,13 @@ def classify_emails_llm(emails: list[dict]) -> dict[str, tuple[str, str]]:
             f"  date: {m.get('date','')}"
         )
 
-    # SSOT: vault gmail-capture.md §1·§2. 추출 실패 시에만 인라인 fallback.
+    # SSOT: vault gmail-capture.md §1·§2 (사용자 컨텍스트·few-shot 포함).
+    # 추출 실패 시에만 인라인 fallback.
     vault_guide = _vault_classification_guide()
     if vault_guide:
         guide_block = (
-            "분류 기준 — 아래는 2nd-brain-vault `gmail-capture.md` §1·§2 의 권위 정의다. "
-            "이 정의를 따르라.\n\n"
+            "분류 기준 — 아래는 2nd-brain-vault `gmail-capture.md` §1·§2 의 권위 정의다 "
+            "(사용자 컨텍스트 + few-shot 예시 포함). 이 정의를 따르라.\n\n"
             f"{vault_guide}\n"
         )
     else:
@@ -363,15 +430,25 @@ def classify_emails_llm(emails: list[dict]) -> dict[str, tuple[str, str]]:
             "(라벨 '브레인화/불필요' + archive)\n"
         )
 
+    today = now_kst()
+    today_str = f"{today.date().isoformat()} ({DOW_KR[today.date().weekday()]})"
+
     prompt = (
         f"다음 {len(emails)}개 Gmail 메일을 분류하라. **반드시 JSON 배열만 응답하라** (다른 텍스트 금지).\n\n"
+        f"오늘 날짜 (KST): {today_str}\n"
+        f"  → '이미 지난 행사' / '예정된 행사' 판단 시 이 기준으로 비교할 것.\n\n"
         f"{guide_block}\n"
-        "출력 카테고리는 다음 3개 중 하나:\n"
+        "출력 카테고리 (3 중 하나) + 자신감 (3 중 하나):\n"
         "- proceed → 라벨 '브레인화/진행' + archive\n"
         "- pending → 라벨 '브레인화/보류' + inbox 유지\n"
-        "- noise   → 라벨 '브레인화/불필요' + archive (명백한 중복은 trash)\n\n"
+        "- noise   → 라벨 '브레인화/불필요' + archive (명백한 중복은 trash)\n"
+        "- confidence: high | med | low\n"
+        "  high = 발신자/제목/예시 매칭이 명확.\n"
+        "  med  = 합리적 추정이나 미세한 모호함 존재.\n"
+        "  low  = 자신없음. (low 응답은 시스템이 자동으로 pending 으로 강등하니, "
+        "정말 모를 때만 사용하라.)\n\n"
         "응답 형식 (JSON 배열만):\n"
-        '[{"id":"<msg_id>","category":"proceed|pending|noise","reason":"한 줄 이유"}]\n\n'
+        '[{"id":"<msg_id>","category":"proceed|pending|noise","confidence":"high|med|low","reason":"한 줄 이유"}]\n\n'
         "메일 목록:\n" + "\n\n".join(items_text)
     )
 
@@ -380,7 +457,7 @@ def classify_emails_llm(emails: list[dict]) -> dict[str, tuple[str, str]]:
     # 에러가 난다 (commander.js variadic semantics).
     cmd = [
         "claude", "--print", "--permission-mode", "bypassPermissions",
-        "--model", "claude-haiku-4-5",
+        "--model", "claude-opus-4-7",
         "--disallowedTools", "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
     ]
     try:
@@ -426,8 +503,15 @@ def classify_emails_llm(emails: list[dict]) -> dict[str, tuple[str, str]]:
             mid = r_item.get("id")
             cat = r_item.get("category", "pending")
             reason = (r_item.get("reason") or "").strip()
-            if mid and cat in valid_cats:
-                by_id[mid] = (cat, reason or "(이유 없음)")
+            confidence = (r_item.get("confidence") or "med").lower()
+            if not mid or cat not in valid_cats:
+                continue
+            # 안전장치: low confidence 는 pending 으로 강등.
+            # 이미 pending 인 경우는 reason 만 보강.
+            if confidence == "low" and cat != "pending":
+                reason = f"(자신없음 → 보류 강등; LLM 1차 판단={cat}) {reason}"
+                cat = "pending"
+            by_id[mid] = (cat, reason or "(이유 없음)")
     return by_id
 
 
@@ -484,8 +568,8 @@ def build_plan_items(emails: list, existing_plan: dict | None) -> list[dict]:
             items.append(it)
             continue
         cat, reason = classify_email_heuristic(m)
-        if cat == "noise":
-            items.append(_make_item(m, "noise", f"발신자 패턴 '{reason}'"))
+        if cat is not None:
+            items.append(_make_item(m, cat, reason))
         else:
             needs_llm.append(m)
 
@@ -507,25 +591,27 @@ def build_plan_items(emails: list, existing_plan: dict | None) -> list[dict]:
 # ============================================================================
 
 def sort_plan_items(items: list[dict]) -> list[dict]:
-    """CATEGORY_ORDER 우선순위 + 같은 분류 안에선 date 역순 (최신이 위).
-    메시지 가독성 + Ben 이 자연스럽게 위에서 아래로 읽도록."""
-    def key(it):
+    """CATEGORY_ORDER 우선순위 + 같은 분류 안에선 date 역순 (최신이 위, Gmail 받은편지함 순서와 일치).
+    그룹별로 명시 재정렬해 캐시 머지·heuristic vs LLM 분류 순서 차이가 결과에 영향 안 미치도록 보장."""
+    def cat_idx(it):
         cat = it.get("category", "pending")
         try:
-            cat_idx = CATEGORY_ORDER.index(cat)
+            return CATEGORY_ORDER.index(cat)
         except ValueError:
-            cat_idx = len(CATEGORY_ORDER)
-        # date 는 문자열 — 역순 정렬을 위해 음수 ordering 트릭 대신 reverse 적용 어려우니
-        # tuple 의 두 번째 요소는 negated date 처럼 역순 비교 가능한 값을 만들어야.
-        # 단순화: 같은 카테고리 안에선 안정 정렬 + 외부에서 fetch 순서가 이미 최신순이므로 그대로.
-        return (cat_idx,)
-    return sorted(items, key=key)
+            return len(CATEGORY_ORDER)
+    by_cat: dict[int, list[dict]] = {}
+    for it in items:
+        by_cat.setdefault(cat_idx(it), []).append(it)
+    out: list[dict] = []
+    for idx in sorted(by_cat.keys()):
+        out.extend(sorted(by_cat[idx], key=lambda it: it.get("date", ""), reverse=True))
+    return out
 
 
 def merge_plan(state: dict, emails: list[dict], now: dt.datetime) -> dict:
-    """현재 unread emails 를 분류(캐시 활용) 후 pending plan 에 머지.
+    """현재 받은편지함 미분류 emails 를 분류(캐시 활용) 후 pending plan 에 머지.
     - 신규 메일만 LLM 호출. 기존 plan 의 msg_id 는 분류 그대로 재사용.
-    - 외부에서 처리된 (unread 에서 사라진) msg_id 는 plan 에서 제거.
+    - 외부에서 처리된 (검색 결과에서 사라진) msg_id 는 plan 에서 제거.
     - plan 의 created_at 은 첫 생성 시점 유지.
     - items 는 카테고리 우선순위로 정렬해 표시 안정성 확보."""
     existing = state.get("pending_plan") or {}
@@ -553,7 +639,9 @@ def fmt_email_line(num: int, m: dict) -> str:
     subj = m.get("subject") or "(제목 없음)"
     frm = m.get("from") or ""
     date = m.get("date") or ""
-    return f"{num}. {date}  {frm}\n   제목: {subj}"
+    mid = m.get("msg_id") or m.get("id") or ""
+    id_tag = f"[{mid}] " if mid else ""
+    return f"{num}. {id_tag}{date}  {frm}\n   제목: {subj}"
 
 
 def format_plan_message(now: dt.datetime, plan: dict, new_count: int, total_count: int) -> str:
@@ -570,9 +658,9 @@ def format_plan_message(now: dt.datetime, plan: dict, new_count: int, total_coun
     L.append(f"[Gmail 브리핑] {fmt_date_kr(now.date())} {now.strftime('%H:%M')}")
     L.append("")
     if new_count == total_count:
-        L.append(f"안 읽은 메일 {total_count}건이 있습니다. 아래 3분류대로 브레인화를 진행할지 검토 바랍니다.")
+        L.append(f"받은편지함 미분류 메일 {total_count}건이 있습니다. 브레인화 진행/불필요/보류로 분류한 것을 검토 바랍니다.")
     else:
-        L.append(f"안 읽은 메일 {total_count}건이 있습니다 (이번에 신규 {new_count}건 추가). 아래 3분류대로 브레인화를 진행할지 검토 바랍니다.")
+        L.append(f"받은편지함 미분류 메일 {total_count}건이 있습니다 (이번에 신규 {new_count}건 추가). 브레인화 진행/불필요/보류로 분류한 것을 검토 바랍니다.")
     L.append("")
 
     def emit_section(header_text: str, items_list: list[dict]):
@@ -604,11 +692,12 @@ def format_plan_message(now: dt.datetime, plan: dict, new_count: int, total_coun
     emit_section(noise_header, by_cat.get("noise", []))
 
     L.append("[명령]")
-    L.append("  /gws-assistant approve   — 보류·불필요 일괄 처리 + 진행 1건씩 검토 시작")
-    L.append("  /gws-assistant cancel    — plan 폐기, 다음 폴링에서 재분류")
-    L.append("  /gws-assistant snooze 60 — 60분 발화 보류")
+    L.append("  /g 승인  (= 진행 / 확정 / 예 / 네 / 맞아 / 좋아 / OK / confirm / approve)")
+    L.append("           — 보류·불필요 일괄 처리 + 진행 1건씩 검토 시작")
+    L.append("  /g 취소  (= cancel)        — plan 폐기, 다음 폴링에서 재분류")
+    L.append("  /g 보류  (= 스킵 / skip / 나중에)  — 60분 발화 보류 (snooze)")
     L.append("")
-    L.append("(진행 항목은 approve 후 1건씩 보고됩니다 — 각 보고에 confirm/edit/skip 명령이 함께 옵니다.)")
+    L.append("(진행 항목은 승인 후 1건씩 보고됩니다 — 각 보고에 /g 확정 · /g 편집 · /g 스킵 · /g 불필요 가 함께 옵니다.)")
     L.append("")
     L.append(f"[plan id] {plan.get('plan_id', '')}")
     L.append(f"[처리 시각] {now.isoformat()}")
@@ -1063,8 +1152,11 @@ def propose_proceed(item: dict) -> tuple[bool, str]:
 def finalize_proceed(item: dict) -> tuple[bool, str]:
     """Brainify Phase 2 — 사용자 confirm 후:
     1) PARA 폴더로 노트·첨부 이동 (proposed_para_path 가 있으면)
-    2) 라벨 + archive
-    노트 자체는 propose 단계에서 이미 작성됨."""
+    2) 자동 라벨링 + archive
+       - followups 비어있으면 → LABEL_DONE (terminal — 영구 보존)
+       - followups 있으면 → LABEL_PROCEED (임시 — 후속 작업 진행 중)
+    노트 자체는 propose 단계에서 이미 작성됨.
+    item['final_label'] 에 실제 부착된 라벨 기록 (출력용)."""
     thread_id = item.get("msg_id")
     if not thread_id:
         return (False, "thread_id 없음")
@@ -1075,13 +1167,17 @@ def finalize_proceed(item: dict) -> tuple[bool, str]:
         if not ok:
             return (False, f"PARA 이동 실패: {err}")
 
+    has_followups = bool(item.get("followups"))
+    label_to_apply = LABEL_PROCEED if has_followups else LABEL_DONE
+
     ok, err = gog_call(
         "gmail", "labels", "modify", thread_id,
-        "--add", LABEL_PROCEED, "--remove", "INBOX",
+        "--add", label_to_apply, "--remove", "INBOX",
     )
     if not ok:
         return (False, f"라벨/archive 실패: {err}")
     item["confirm_status"] = "confirmed"
+    item["final_label"] = label_to_apply
     return (True, "")
 
 
@@ -1310,6 +1406,15 @@ def _next_pending_review(plan: dict) -> dict | None:
     return None
 
 
+def _count_pending_review(plan: dict) -> int:
+    """proceed 큐에서 confirm_status="pending_review" 인 항목 수 — confirm/edit/skip/dismiss
+    이후 잔여 큐 가시성 표시용."""
+    return sum(
+        1 for it in _proceed_items(plan)
+        if it.get("confirm_status") == "pending_review"
+    )
+
+
 def _proceed_review_index(plan: dict, item: dict) -> tuple[int, int]:
     """Return (1-based index, total) of `item` within proceed items."""
     proceed = _proceed_items(plan)
@@ -1327,15 +1432,172 @@ def _find_item_by_thread(plan: dict, thread_id: str) -> dict | None:
     return None
 
 
+def _require_pending_review(plan: dict | None, thread_id: str) -> tuple[dict | None, str]:
+    """후속조치 명령 전제 검사: 대상 thread 가 큐의 현재 review 항목이어야 한다.
+    Returns (item, "") on success, (None, error_message) on rejection."""
+    if not plan:
+        return (None, "pending plan 이 없습니다.")
+    item = _find_item_by_thread(plan, thread_id)
+    if not item:
+        return (None, f"thread_id '{thread_id}' 항목을 찾을 수 없습니다.")
+    if item.get("category") != "proceed":
+        return (None, f"proceed 항목이 아닙니다 (category={item.get('category')}).")
+    if item.get("confirm_status") != "pending_review":
+        return (None, f"이미 처리된 항목입니다 (status={item.get('confirm_status')}).")
+    return (item, "")
+
+
+def _resolve_pending_review_thread(
+    plan: dict | None, thread_id: str | None,
+) -> tuple[dict | None, str]:
+    """thread_id 가 명시되면 그것으로, 생략 시 review 대기 항목이 정확히 1건이면 자동 보강.
+    cmd_nl 의 단일 pending_review 자동 보강 패턴과 동일한 규칙을 confirm/edit/skip/dismiss
+    에서 공유하기 위한 헬퍼. Returns (item, "") on success, (None, err) on rejection."""
+    if not plan:
+        return (None, "pending plan 이 없습니다.")
+    if thread_id:
+        item = _find_item_by_thread(plan, thread_id)
+        if not item:
+            return (None, f"thread_id '{thread_id}' 항목을 찾을 수 없습니다.")
+        if (item.get("category") != "proceed"
+                or item.get("confirm_status") != "pending_review"):
+            return (None, f"thread_id '{thread_id}' 가 review 대기 상태가 아닙니다.")
+        return (item, "")
+    candidates = [
+        it for it in _proceed_items(plan)
+        if it.get("confirm_status") == "pending_review"
+    ]
+    if len(candidates) == 0:
+        return (None, "현재 review 대기 항목이 없습니다.")
+    if len(candidates) > 1:
+        tids = ", ".join(it.get("msg_id", "") for it in candidates)
+        return (None, f"review 대기 항목이 여러 개입니다 ({tids}) — thread_id 를 명시하세요.")
+    return (candidates[0], "")
+
+
+def _yaml_inline_followup(entry: dict) -> str:
+    """followup dict → YAML flow-style inline mapping."""
+    parts: list[str] = []
+    for k, v in entry.items():
+        if isinstance(v, str):
+            esc = v.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'{k}: "{esc}"')
+        else:
+            parts.append(f"{k}: {v}")
+    return "{" + ", ".join(parts) + "}"
+
+
+def _append_followup(item: dict, entry: dict) -> tuple[bool, str]:
+    """item['followups'] 에 entry append + 스테이징 노트 frontmatter 갱신.
+    노트가 아직 없거나(propose 전) 사라졌으면 frontmatter 갱신은 skip."""
+    fls = list(item.get("followups") or [])
+    fls.append(entry)
+    item["followups"] = fls
+
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return (True, "")
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return (True, "")
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return (False, f"노트 읽기 실패: {e}")
+
+    yaml_lines = [_yaml_inline_followup(fl) for fl in fls]
+    text2 = _replace_fm_field_list(text, "followups", yaml_lines)
+
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(note_path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text2)
+        os.replace(tmp, note_path)
+    except OSError as e:
+        return (False, f"노트 쓰기 실패: {e}")
+    return (True, "")
+
+
+def _append_todo_to_note(item: dict, todo_text: str) -> tuple[bool, str]:
+    """노트 본문에 '## 후속 액션' 섹션을 만들고 - [ ] 라인을 append."""
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return (True, "")
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return (True, "")
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return (False, f"노트 읽기 실패: {e}")
+
+    line = f"- [ ] {todo_text}"
+    if "## 후속 액션" in text:
+        # 섹션 내 마지막 위치에 append: '## 후속 액션' 헤더 다음 블록 끝에 삽입
+        idx = text.find("## 후속 액션")
+        # find next "## " header after idx
+        rest = text[idx:]
+        nl = rest.find("\n")
+        if nl < 0:
+            new_text = text + "\n" + line + "\n"
+        else:
+            section_start = idx + nl + 1
+            next_h = text.find("\n## ", section_start)
+            if next_h < 0:
+                new_text = text.rstrip() + "\n" + line + "\n"
+            else:
+                new_text = text[:next_h].rstrip() + "\n" + line + "\n" + text[next_h:]
+    else:
+        # ## 원본 메일 직전에 ## 후속 액션 섹션 신규 삽입; 없으면 끝에.
+        anchor = text.find("\n## 원본 메일")
+        block = "\n\n## 후속 액션\n\n" + line + "\n"
+        if anchor >= 0:
+            new_text = text[:anchor].rstrip() + block + text[anchor:]
+        else:
+            new_text = text.rstrip() + block + "\n"
+
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(note_path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        os.replace(tmp, note_path)
+    except OSError as e:
+        return (False, f"노트 쓰기 실패: {e}")
+    return (True, "")
+
+
+def _parse_kv_args(argv: list[str], keys: tuple[str, ...]) -> dict[str, str]:
+    """`when=...` `duration=...` 같은 key=value 인자를 dict 로 파싱.
+    값에 공백이 있을 수 있으므로 argv 결합 후 다음 known key 직전까지 캡처."""
+    rest = " ".join(argv)
+    out: dict[str, str] = {}
+    key_alt = "|".join(re.escape(k) for k in keys)
+    for k in keys:
+        pat = re.compile(
+            rf"(?:^|\s){re.escape(k)}=(.+?)(?=\s+(?:{key_alt})=|$)",
+            re.DOTALL,
+        )
+        m = pat.search(rest)
+        if m:
+            out[k] = m.group(1).strip().strip('"').strip("'")
+    return out
+
+
 def _parse_edit_args(argv: list[str]) -> tuple[str, str | None, list[str] | None]:
-    """edit <thread_id> [folder=…] [links=<[[A]],[[B]]>] 파싱."""
+    """edit [thread_id] [folder=…] [links=<[[A]],[[B]]>] 파싱.
+    thread_id 생략 시 첫 토큰이 'key=value' 형태이면 tid="" 로 반환 (호출측에서 자동 보강)."""
     if not argv:
         return ("", None, None)
-    tid = argv[0]
+    if "=" in argv[0]:
+        tid = ""
+        rest_argv = argv
+    else:
+        tid = argv[0]
+        rest_argv = argv[1:]
     folder: str | None = None
     links: list[str] | None = None
     # links= 값에 쉼표가 있을 수 있으니, argv 결합 후 key= 분리.
-    rest = " ".join(argv[1:])
+    rest = " ".join(rest_argv)
     # split by token boundaries " folder=" or " links=" while preserving order.
     # 간단화: positional 파라미터로 'folder=' / 'links=' 만 찾는다.
     m_folder = re.search(r"(?:^|\s)folder=(.+?)(?=\s+(?:folder=|links=)|$)", rest)
@@ -1387,6 +1649,25 @@ def format_proposal_message(now: dt.datetime, item: dict, idx: int, total: int) 
         L.append("")
         L.append("## 요약 미리보기")
         L.append(summary)
+    followups = item.get("followups") or []
+    if followups:
+        L.append("")
+        L.append("[기록된 후속조치]")
+        for fl in followups:
+            kind = fl.get("kind", "?")
+            if kind == "draft-reply":
+                L.append(f"  · 회신 초안 (Drafts) — to {fl.get('to','')} "
+                         f"[{fl.get('at','')}]")
+            elif kind == "schedule":
+                L.append(f"  · 일정 등록 — {fl.get('summary','')} "
+                         f"@ {fl.get('start','')}")
+            elif kind == "replied":
+                note = f" — {fl.get('summary')}" if fl.get("summary") else ""
+                L.append(f"  · 회신 완료 기록 [{fl.get('at','')}]{note}")
+            elif kind == "todo":
+                L.append(f"  · 후속 액션: {fl.get('text','')}")
+            else:
+                L.append(f"  · {kind} [{fl.get('at','')}]")
     L.append("")
     tid = item.get("msg_id", "")
     L.append("[명령]")
@@ -1396,6 +1677,16 @@ def format_proposal_message(now: dt.datetime, item: dict, idx: int, total: int) 
     L.append(f"      → PARA 위치/연결 수정 후 확정")
     L.append(f"  /gws-assistant skip {tid}")
     L.append(f"      → 이 메일 건너뛰기 (라벨 '{LABEL_PENDING}', inbox 유지, 노트 정리)")
+    L.append("[후속조치 (선택, 누적 가능)]")
+    L.append(f"  /gws-assistant draft-reply {tid} [톤·요지]")
+    L.append(f"      → Opus 회신 초안 → Gmail Drafts 등록 (발송 안 함)")
+    L.append(f"  /gws-assistant schedule {tid} when=YYYY-MM-DD HH:MM "
+             f"[duration=60] [summary=…]")
+    L.append(f"      → Calendar primary 에 이벤트 생성")
+    L.append(f"  /gws-assistant replied {tid} [요약]")
+    L.append(f"      → 이미 회신했음을 노트에 기록")
+    L.append(f"  /gws-assistant todo {tid} <할일>")
+    L.append(f"      → 노트 '## 후속 액션' 섹션에 - [ ] 라인 추가")
     return "\n".join(L)
 
 
@@ -1451,6 +1742,21 @@ def is_snoozed(state: dict, now: dt.datetime) -> bool:
 # ============================================================================
 # Subcommand handlers
 # ============================================================================
+
+def _safety_bulk_label(plan: dict) -> str:
+    """confirm/edit/skip/dismiss 진입 시 미처리 pending/noise 가 남아 있으면 라벨 일괄 처리.
+    approve 를 건너뛰고 reclassify 후 곧장 proceed 처리로 진입한 경우의 안전망.
+    함수는 idempotent — 이미 confirmed 인 항목은 _bulk_label_pending_noise 에서 스킵됨.
+    Returns 보고용 헤더 라인 (작업 없으면 빈 문자열)."""
+    summary = _bulk_label_pending_noise(plan)
+    ok_total = summary.get("pending_ok", 0) + summary.get("noise_ok", 0)
+    if ok_total == 0:
+        return ""
+    return (
+        f"[approve 누락 보강] 보류 {summary['pending_ok']}건, "
+        f"불필요 {summary['noise_ok']}건 라벨/archive 처리됨.\n\n"
+    )
+
 
 def _bulk_label_pending_noise(plan: dict) -> dict:
     """pending/noise 항목들을 라벨/archive 일괄 처리. proceed 는 건드리지 않음."""
@@ -1547,21 +1853,16 @@ def cmd_approve(state: dict, now: dt.datetime) -> int:
     return 0
 
 
-def cmd_confirm(state: dict, now: dt.datetime, thread_id: str) -> int:
+def cmd_confirm(state: dict, now: dt.datetime, thread_id: str | None = None) -> int:
+    """thread_id 명시 시 해당 항목, 생략 시 단일 pending_review 항목을 PARA 로 확정 이동
+    + 라벨/archive. 진입 시 미처리 pending/noise 가 있으면 함께 라벨 일괄 처리 (safety net)."""
     plan = state.get("pending_plan")
-    if not plan:
-        print("[브레인화] pending plan 이 없습니다.")
-        return 0
-    item = _find_item_by_thread(plan, thread_id)
+    item, err = _resolve_pending_review_thread(plan, thread_id)
     if not item:
-        print(f"[브레인화] thread_id '{thread_id}' 항목을 찾을 수 없습니다.")
+        print(f"[브레인화] {err}")
         return 0
-    if item.get("category") != "proceed":
-        print(f"[브레인화] proceed 항목이 아닙니다 (category={item.get('category')}).")
-        return 0
-    if item.get("confirm_status") != "pending_review":
-        print(f"[브레인화] 이미 처리된 항목입니다 (status={item.get('confirm_status')}).")
-        return 0
+
+    safety = _safety_bulk_label(plan)
 
     ok, err = finalize_proceed(item)
     if not ok:
@@ -1571,9 +1872,13 @@ def cmd_confirm(state: dict, now: dt.datetime, thread_id: str) -> int:
         return 0
 
     para = item.get("proposed_para_path") or "sources/00_inbox/"
+    residual = _count_pending_review(plan)
+    final_label = item.get("final_label") or LABEL_PROCEED
     header = (
-        f"[브레인화 확정] {_short_subject(item.get('subject',''), 40)} "
-        f"→ 노트 위치 {para}, 라벨 '{LABEL_PROCEED}' + archive\n\n"
+        safety
+        + f"[브레인화 확정] {_short_subject(item.get('subject',''), 40)} "
+        + f"→ 노트 위치 {para}, 라벨 '{final_label}' + archive\n"
+        + f"  · 잔여 review 대기 {residual}건\n\n"
     )
     msg = _propose_next_or_complete(state, plan, now, header)
     print(msg)
@@ -1583,22 +1888,19 @@ def cmd_confirm(state: dict, now: dt.datetime, thread_id: str) -> int:
 
 
 def cmd_edit(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """thread_id 명시 시 해당 항목, 생략 시 단일 pending_review 항목의 노트를 수정 후 확정.
+    진입 시 미처리 pending/noise 가 있으면 함께 라벨 일괄 처리 (safety net)."""
     thread_id, folder, links = _parse_edit_args(argv)
-    if not thread_id:
-        print("[브레인화] edit 명령에는 thread_id 가 필요합니다.")
-        return 1
     plan = state.get("pending_plan")
-    if not plan:
-        print("[브레인화] pending plan 이 없습니다.")
-        return 0
-    item = _find_item_by_thread(plan, thread_id)
-    if (not item or item.get("category") != "proceed"
-            or item.get("confirm_status") != "pending_review"):
-        print(f"[브레인화] thread_id '{thread_id}' 가 review 대기 상태가 아닙니다.")
+    item, err = _resolve_pending_review_thread(plan, thread_id or None)
+    if not item:
+        print(f"[브레인화] {err}")
         return 0
     if folder is None and links is None:
         print("[브레인화] edit 에 folder= 또는 links= 중 하나는 필요합니다.")
         return 1
+
+    safety = _safety_bulk_label(plan)
 
     ok, err = update_proceed_note(item, folder, links)
     if not ok:
@@ -1614,9 +1916,13 @@ def cmd_edit(state: dict, now: dt.datetime, argv: list[str]) -> int:
         return 0
 
     para = item.get("proposed_para_path") or "sources/00_inbox/"
+    residual = _count_pending_review(plan)
+    final_label = item.get("final_label") or LABEL_PROCEED
     header = (
-        f"[브레인화 수정 후 확정] {_short_subject(item.get('subject',''), 40)} "
-        f"→ 노트 위치 {para}, 라벨 '{LABEL_PROCEED}' + archive\n\n"
+        safety
+        + f"[브레인화 수정 후 확정] {_short_subject(item.get('subject',''), 40)} "
+        + f"→ 노트 위치 {para}, 라벨 '{final_label}' + archive\n"
+        + f"  · 잔여 review 대기 {residual}건\n\n"
     )
     msg = _propose_next_or_complete(state, plan, now, header)
     print(msg)
@@ -1625,16 +1931,64 @@ def cmd_edit(state: dict, now: dt.datetime, argv: list[str]) -> int:
     return 0
 
 
-def cmd_skip(state: dict, now: dt.datetime, thread_id: str) -> int:
+def cmd_dismiss(state: dict, now: dt.datetime, thread_id: str | None = None) -> int:
+    """proposed 단계 항목을 '불필요' 로 폐기 (skip 의 noise 버전).
+    노트 삭제 + 라벨 '브레인화/불필요' + archive + 다음 큐 propose.
+    thread_id 생략 시 단일 pending_review 항목 자동 보강.
+    진입 시 미처리 pending/noise 가 있으면 함께 라벨 일괄 처리 (safety net)."""
     plan = state.get("pending_plan")
-    if not plan:
-        print("[브레인화] pending plan 이 없습니다.")
+    item, err = _resolve_pending_review_thread(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
         return 0
-    item = _find_item_by_thread(plan, thread_id)
-    if (not item or item.get("category") != "proceed"
-            or item.get("confirm_status") != "pending_review"):
-        print(f"[브레인화] thread_id '{thread_id}' 가 review 대기 상태가 아닙니다.")
+    thread_id = item.get("msg_id", "")
+
+    safety = _safety_bulk_label(plan)
+
+    note_rel = item.get("note_path")
+    if note_rel:
+        note_full = VAULT_ROOT / note_rel
+        try:
+            note_full.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    ok, err = gog_call(
+        "gmail", "labels", "modify", thread_id,
+        "--add", LABEL_NOISE, "--remove", "INBOX",
+    )
+    if not ok:
+        print(f"[브레인화 폐기 실패] {err}\n해당 항목은 큐에 남아있습니다.")
+        state["last_checked"] = now.isoformat()
+        save_state(state)
         return 0
+    item["confirm_status"] = "dismissed"
+
+    residual = _count_pending_review(plan)
+    header = (
+        safety
+        + f"[브레인화 폐기] {_short_subject(item.get('subject',''), 40)} "
+        + f"→ 라벨 '{LABEL_NOISE}' + archive. 노트 파일 정리됨.\n"
+        + f"  · 잔여 review 대기 {residual}건\n\n"
+    )
+    msg = _propose_next_or_complete(state, plan, now, header)
+    print(msg)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+def cmd_skip(state: dict, now: dt.datetime, thread_id: str | None = None) -> int:
+    """thread_id 명시 시 해당 항목, 생략 시 단일 pending_review 항목을 보류 처리.
+    진입 시 미처리 pending/noise 가 있으면 함께 라벨 일괄 처리 (safety net)."""
+    plan = state.get("pending_plan")
+    item, err = _resolve_pending_review_thread(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+    thread_id = item.get("msg_id", "")
+
+    safety = _safety_bulk_label(plan)
 
     note_rel = item.get("note_path")
     if note_rel:
@@ -1652,15 +2006,510 @@ def cmd_skip(state: dict, now: dt.datetime, thread_id: str) -> int:
         return 0
     item["confirm_status"] = "skipped"
 
+    residual = _count_pending_review(plan)
     header = (
-        f"[브레인화 건너뛰기] {_short_subject(item.get('subject',''), 40)} "
-        f"→ 라벨 '{LABEL_PENDING}' (inbox 유지). 노트 파일 정리됨.\n\n"
+        safety
+        + f"[브레인화 건너뛰기] {_short_subject(item.get('subject',''), 40)} "
+        + f"→ 라벨 '{LABEL_PENDING}' (inbox 유지). 노트 파일 정리됨.\n"
+        + f"  · 잔여 review 대기 {residual}건\n\n"
     )
     msg = _propose_next_or_complete(state, plan, now, header)
     print(msg)
     state["last_checked"] = now.isoformat()
     save_state(state)
     return 0
+
+
+def _reemit_proposal(state: dict, plan: dict, now: dt.datetime,
+                     item: dict, header: str) -> str:
+    """후속조치 적용 후 동일 항목의 proposal 메시지를 누적 followups 와 함께 재출력."""
+    idx, total = _proceed_review_index(plan, item)
+    body = format_proposal_message(now, item, idx, total)
+    state["pending_plan"] = plan
+    save_state(state)
+    return header + body
+
+
+def cmd_draft_reply(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 review 항목에 대한 회신 초안을 Opus 4.7 로 작성 → Gmail Drafts 등록.
+    발송은 안 함 (사용자가 Gmail UI 에서 검토 후 발송)."""
+    if not argv:
+        print("[브레인화] draft-reply 에는 thread_id 가 필요합니다.")
+        return 1
+    thread_id = argv[0]
+    instruction = " ".join(argv[1:]).strip()
+    plan = state.get("pending_plan")
+    item, err = _require_pending_review(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+
+    payload = fetch_thread_full(thread_id, out_dir=None)
+    if payload is None:
+        print("[브레인화 회신 초안 실패] thread fetch 실패. 큐 상태 유지.")
+        return 0
+    msg = _pick_target_message(payload, thread_id)
+    if not msg:
+        print("[브레인화 회신 초안 실패] 메시지 추출 실패. 큐 상태 유지.")
+        return 0
+    headers = _headers_to_dict(msg.get("payload", {}).get("headers", []))
+    frm = headers.get("from", "")
+    subject = headers.get("subject", "(제목 없음)")
+    reply_to = headers.get("reply-to", "") or frm
+    body_text = _extract_plain_text(msg.get("payload") or {}) or msg.get("snippet", "")
+
+    prompt = (
+        "다음 Gmail 메일에 대한 한국어 회신 초안을 작성하라. "
+        "Dr. Ben(benkorea.ai@gmail.com)이 보낼 회신이며, 정중한 존댓말을 사용한다. "
+        "응답은 회신 본문만 — 인사·서명 포함 가능, 코드블록·메타 설명·해설은 금지.\n\n"
+        f"[원본 메일 from: {frm}]\n[subject: {subject}]\n\n"
+        f"[원본 본문]\n{body_text[:4000]}\n\n"
+        f"[사용자 지시]\n{instruction or '(특별한 지시 없음 — 의례적 회신 초안 작성)'}\n"
+    )
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-opus-4-7",
+        "--disallowedTools",
+        "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        print("[브레인화 회신 초안 실패] LLM timeout. 큐 상태 유지.")
+        return 0
+    if r.returncode != 0:
+        print(f"[브레인화 회신 초안 실패] LLM exit={r.returncode}.")
+        return 0
+    body = (r.stdout or "").strip()
+    if body.startswith("```"):
+        nl = body.find("\n")
+        body = body[nl + 1:] if nl >= 0 else body[3:]
+        if body.rstrip().endswith("```"):
+            body = body.rstrip()[:-3]
+        body = body.strip()
+    if not body:
+        print("[브레인화 회신 초안 실패] LLM 빈 응답. 큐 상태 유지.")
+        return 0
+
+    re_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+    fd_b, body_file = tempfile.mkstemp(prefix=".gws-reply.", suffix=".txt")
+    try:
+        with os.fdopen(fd_b, "w", encoding="utf-8") as f:
+            f.write(body)
+        out_json = gog_json(
+            "gmail", "drafts", "create",
+            "--to", reply_to,
+            "--subject", re_subject,
+            "--body-file", body_file,
+            "--reply-to-message-id", thread_id,
+        )
+    finally:
+        try:
+            os.unlink(body_file)
+        except OSError:
+            pass
+
+    if out_json is None or out_json == []:
+        print("[브레인화 회신 초안 실패] gog drafts create 실패. 큐 상태 유지.")
+        return 0
+    draft_id = ""
+    if isinstance(out_json, dict):
+        draft_id = out_json.get("id") or ""
+
+    entry = {
+        "kind": "draft-reply",
+        "at": now.isoformat(timespec="seconds"),
+        "draft_id": draft_id,
+        "to": reply_to,
+        "subject": re_subject,
+    }
+    _append_followup(item, entry)
+
+    preview = body[:300] + ("…" if len(body) > 300 else "")
+    header = (
+        f"[회신 초안 작성됨] {_short_subject(item.get('subject',''), 40)}\n"
+        f"  · 수신자: {reply_to}\n"
+        f"  · Gmail Drafts 폴더에서 검토 후 발송"
+        + (f" (draft_id={draft_id})" if draft_id else "")
+        + "\n\n"
+        f"본문 미리보기:\n{preview}\n\n"
+    )
+    msg_text = _reemit_proposal(state, plan, now, item, header)
+    print(msg_text)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+def _parse_when_to_iso(when: str, default_duration_min: int = 60
+                       ) -> tuple[str | None, str | None, str]:
+    """'YYYY-MM-DD HH:MM' (KST 가정) → (start_rfc3339, end_rfc3339, error).
+    'T' 구분자도 허용. 이미 +HH:MM 가 있으면 그대로 둠."""
+    s = when.strip()
+    # accept "YYYY-MM-DD HH:MM" or "YYYY-MM-DDTHH:MM" or with seconds/offset
+    m = re.match(
+        r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(\s*[+-]\d{2}:?\d{2})?$",
+        s,
+    )
+    if not m:
+        return (None, None, f"when 파싱 실패: '{when}' (형식: YYYY-MM-DD HH:MM)")
+    date_part, time_part, offset = m.group(1), m.group(2), m.group(3)
+    if len(time_part) == 5:  # HH:MM
+        time_part = time_part + ":00"
+    if not offset:
+        offset = "+09:00"
+    else:
+        offset = offset.strip().replace("+", "+").replace("-", "-")
+        if ":" not in offset:
+            offset = offset[:3] + ":" + offset[3:]
+    try:
+        start = dt.datetime.fromisoformat(f"{date_part}T{time_part}{offset}")
+    except ValueError as e:
+        return (None, None, f"when 파싱 실패: {e}")
+    end = start + dt.timedelta(minutes=default_duration_min)
+    return (start.isoformat(timespec="seconds"),
+            end.isoformat(timespec="seconds"), "")
+
+
+def cmd_schedule(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 review 항목과 연계된 Calendar(primary) 이벤트 생성.
+    Usage: schedule <thread_id> when=YYYY-MM-DD HH:MM [duration=60] [summary=텍스트]"""
+    if not argv:
+        print("[브레인화] schedule 에는 thread_id 가 필요합니다.")
+        return 1
+    thread_id = argv[0]
+    plan = state.get("pending_plan")
+    item, err = _require_pending_review(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+
+    kv = _parse_kv_args(argv[1:], ("when", "duration", "summary"))
+    when_raw = kv.get("when", "")
+    if not when_raw:
+        print("[브레인화] schedule 에는 when=YYYY-MM-DD HH:MM 가 필요합니다.")
+        return 1
+    try:
+        duration_min = int(kv.get("duration", "60"))
+    except ValueError:
+        print("[브레인화] duration 은 정수(분).")
+        return 1
+    summary = kv.get("summary") or item.get("subject") or "(일정)"
+
+    start_iso, end_iso, perr = _parse_when_to_iso(when_raw, duration_min)
+    if not start_iso:
+        print(f"[브레인화] {perr}")
+        return 0
+
+    description = f"(gws-assistant 자동 등록)\nGmail thread: {thread_id}"
+    out_json = gog_json(
+        "calendar", "create", "primary",
+        "--summary", summary,
+        "--from", start_iso,
+        "--to", end_iso,
+        "--description", description,
+    )
+    if out_json is None or out_json == []:
+        print("[브레인화 일정 등록 실패] gog calendar create 실패. 큐 상태 유지.")
+        return 0
+    event_id = ""
+    html_link = ""
+    if isinstance(out_json, dict):
+        event_id = out_json.get("id") or ""
+        html_link = out_json.get("htmlLink") or ""
+
+    entry = {
+        "kind": "schedule",
+        "at": now.isoformat(timespec="seconds"),
+        "event_id": event_id,
+        "summary": summary,
+        "start": start_iso,
+        "end": end_iso,
+    }
+    if html_link:
+        entry["htmlLink"] = html_link
+    _append_followup(item, entry)
+
+    header = (
+        f"[일정 등록됨] {summary}\n"
+        f"  · 시작: {start_iso}\n"
+        f"  · 종료: {end_iso}\n"
+        + (f"  · 링크: {html_link}\n" if html_link else "")
+        + "\n"
+    )
+    msg_text = _reemit_proposal(state, plan, now, item, header)
+    print(msg_text)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+def cmd_replied(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 review 항목에 '이미 회신함' 정보를 기록 (외부 호출 없음)."""
+    if not argv:
+        print("[브레인화] replied 에는 thread_id 가 필요합니다.")
+        return 1
+    thread_id = argv[0]
+    summary = " ".join(argv[1:]).strip()
+    plan = state.get("pending_plan")
+    item, err = _require_pending_review(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+
+    entry = {
+        "kind": "replied",
+        "at": now.isoformat(timespec="seconds"),
+    }
+    if summary:
+        entry["summary"] = summary
+    _append_followup(item, entry)
+
+    header = (
+        f"[회신 완료 기록됨] {_short_subject(item.get('subject',''), 40)}\n"
+        + (f"  · 메모: {summary}\n" if summary else "")
+        + "\n"
+    )
+    msg_text = _reemit_proposal(state, plan, now, item, header)
+    print(msg_text)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+def cmd_todo(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 review 항목 노트의 '## 후속 액션' 섹션에 - [ ] 라인 추가."""
+    if len(argv) < 2:
+        print("[브레인화] todo 에는 thread_id 와 할일 텍스트가 필요합니다.")
+        return 1
+    thread_id = argv[0]
+    todo_text = " ".join(argv[1:]).strip()
+    if not todo_text:
+        print("[브레인화] todo 텍스트가 비어 있습니다.")
+        return 1
+    plan = state.get("pending_plan")
+    item, err = _require_pending_review(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+
+    ok, terr = _append_todo_to_note(item, todo_text)
+    if not ok:
+        print(f"[브레인화 todo 실패] {terr}\n큐 상태 유지.")
+        return 0
+    entry = {
+        "kind": "todo",
+        "at": now.isoformat(timespec="seconds"),
+        "text": todo_text,
+    }
+    _append_followup(item, entry)
+
+    header = (
+        f"[후속 액션 추가됨] {_short_subject(item.get('subject',''), 40)}\n"
+        f"  · - [ ] {todo_text}\n\n"
+    )
+    msg_text = _reemit_proposal(state, plan, now, item, header)
+    print(msg_text)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+def _nl_dispatch_one(
+    state: dict, now: dt.datetime, item: dict, action: str, args: dict
+) -> int:
+    """단일 nl action 을 기존 cmd_* 로 위임. cmd_nl 의 dict/list 분기에서 공통 사용."""
+    tid = item.get("msg_id", "")
+    if action == "schedule":
+        sub_argv: list[str] = [tid]
+        if "when" in args:
+            sub_argv.append(f"when={args['when']}")
+        if "duration" in args:
+            sub_argv.append(f"duration={args['duration']}")
+        if args.get("summary"):
+            sub_argv.append(f"summary={args['summary']}")
+        return cmd_schedule(state, now, sub_argv)
+    if action == "draft-reply":
+        instr = (args.get("instruction") or "").strip()
+        sub_argv = [tid] + (instr.split() if instr else [])
+        return cmd_draft_reply(state, now, sub_argv)
+    if action == "replied":
+        summary = (args.get("summary") or "").strip()
+        sub_argv = [tid] + (summary.split() if summary else [])
+        return cmd_replied(state, now, sub_argv)
+    if action == "todo":
+        text = (args.get("text") or "").strip()
+        if not text:
+            print("[브레인화 nl] todo 텍스트 추출 실패.")
+            return 0
+        sub_argv = [tid] + text.split()
+        return cmd_todo(state, now, sub_argv)
+    print(f"[브레인화 nl] 알 수 없는 action: {action}")
+    return 0
+
+
+def cmd_nl(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """자연어 후속조치 dispatcher. Opus 4.7 이 자연어 → 4종 명령(schedule/draft-reply/
+    replied/todo) 중 하나(또는 다중 의도 시 list) 로 변환 후 기존 cmd_* 로 위임.
+    thread_id 가 명시 안 되고 단일 pending_review 항목만 있으면 자동 보강."""
+    if not argv:
+        print("[브레인화] nl 에는 자연어 문장이 필요합니다.")
+        return 1
+
+    plan = state.get("pending_plan")
+    if not plan:
+        print("[브레인화] pending plan 이 없습니다.")
+        return 0
+
+    # 첫 토큰이 plan 의 thread_id 와 매칭하면 명시, 아니면 자동 보강
+    item: dict | None = None
+    natural_text = ""
+    explicit = _find_item_by_thread(plan, argv[0])
+    if explicit:
+        item = explicit
+        natural_text = " ".join(argv[1:]).strip()
+    else:
+        natural_text = " ".join(argv).strip()
+
+    if item is None:
+        candidates = [
+            it for it in _proceed_items(plan)
+            if it.get("confirm_status") == "pending_review"
+        ]
+        if len(candidates) == 0:
+            print("[브레인화] 현재 review 대기 항목이 없습니다.")
+            return 0
+        if len(candidates) > 1:
+            tids = ", ".join(it.get("msg_id", "") for it in candidates)
+            print(f"[브레인화] review 대기 항목이 여러 개입니다 ({tids}) "
+                  f"— thread_id 를 명시하세요.")
+            return 0
+        item = candidates[0]
+    else:
+        if (item.get("category") != "proceed"
+                or item.get("confirm_status") != "pending_review"):
+            print(f"[브레인화] thread_id '{item.get('msg_id')}' "
+                  f"가 review 대기 상태가 아닙니다.")
+            return 0
+
+    if not natural_text:
+        print("[브레인화] 자연어 문장이 비어 있습니다.")
+        return 1
+
+    today_str = (
+        f"{now.date().isoformat()} "
+        f"({DOW_KR[now.date().weekday()]}) {now.strftime('%H:%M')} KST"
+    )
+
+    spec = (
+        "사용 가능한 명령 4가지 — 자연어 지시를 JSON 으로 변환:\n\n"
+        "1. schedule — Calendar(primary) 일정 등록 (KST)\n"
+        '   args: { "when": "YYYY-MM-DD HH:MM", "duration": <분, 정수, 기본 60>,'
+        ' "summary": "<제목, 생략 가능 — 생략 시 메일 제목 사용>" }\n'
+        "   종료시간이 명시되어 있으면 (시작-종료) duration 을 거기서 계산.\n\n"
+        "2. draft-reply — Gmail 회신 초안 작성 (Drafts 등록, 발송 안 함)\n"
+        '   args: { "instruction": "<회신 톤·요지를 한 문장으로>" }\n\n'
+        "3. replied — 이미 회신했음 기록 (외부 호출 없음)\n"
+        '   args: { "summary": "<회신 요약, 옵션>" }\n\n'
+        "4. todo — 노트에 할일 추가\n"
+        '   args: { "text": "<할일 내용>" }\n\n'
+        "응답 형식 (JSON only, 다른 텍스트·코드블록·해설 금지):\n"
+        " - 단일 의도 → object: "
+        '{ "action": "schedule|draft-reply|replied|todo", "args": { ... } }\n'
+        " - 다중 의도 → array of object: "
+        '[ { "action": "...", "args": { ... } }, { "action": "...", "args": { ... } } ]\n\n'
+        "해석 불가능하거나 4종 외 의도이면:\n"
+        '{ "action": "error", "reason": "<짧은 한국어 설명>" }\n\n'
+        "예시:\n"
+        '- "5월 12일 11:30부터 1시간" → '
+        '{"action":"schedule","args":{"when":"2026-05-12 11:30","duration":60}}\n'
+        '- "내일 14시-15시 회의" → '
+        '{"action":"schedule","args":{"when":"<내일>14:00","duration":60}}\n'
+        '- "회신 초안 정중하게 거절" → '
+        '{"action":"draft-reply","args":{"instruction":"정중하게 거절"}}\n'
+        '- "이미 답장했어, OK 라고만 보냄" → '
+        '{"action":"replied","args":{"summary":"OK 회신"}}\n'
+        '- "내일까지 자료 확인" → '
+        '{"action":"todo","args":{"text":"내일까지 자료 확인"}}\n'
+        '- "회신은 했고, 5월12일 11:30부터 인터뷰 일정 추가해줘" → '
+        '[{"action":"replied","args":{}},'
+        '{"action":"schedule","args":{"when":"2026-05-12 11:30","duration":60}}]\n'
+    )
+
+    prompt = (
+        f"오늘 일시 (KST): {today_str}\n"
+        f"이메일 제목 컨텍스트: {item.get('subject','')}\n\n"
+        f"{spec}\n"
+        f"자연어 지시:\n{natural_text}\n"
+    )
+
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-opus-4-7",
+        "--disallowedTools",
+        "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("[브레인화 nl 실패] LLM timeout. 큐 상태 유지.")
+        return 0
+    if r.returncode != 0:
+        print(f"[브레인화 nl 실패] LLM exit={r.returncode}.")
+        return 0
+
+    out = (r.stdout or "").strip()
+    if out.startswith("```"):
+        nl_idx = out.find("\n")
+        out = out[nl_idx + 1:] if nl_idx >= 0 else out[3:]
+        if out.rstrip().endswith("```"):
+            out = out.rstrip()[:-3]
+        out = out.strip()
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        # object 또는 array 어느 쪽이든 가능 — 가장 바깥 괄호 쌍을 찾아 재시도
+        snippet = None
+        for open_ch, close_ch in (("[", "]"), ("{", "}")):
+            try:
+                s = out.index(open_ch)
+                e = out.rindex(close_ch) + 1
+            except ValueError:
+                continue
+            try:
+                parsed = json.loads(out[s:e])
+                snippet = out[s:e]
+                break
+            except json.JSONDecodeError:
+                continue
+        if snippet is None:
+            print(f"[브레인화 nl 실패] LLM 응답 JSON 파싱 실패: {out[:300]}")
+            return 0
+
+    # dict (단일 의도) / list (다중 의도) 양쪽 지원
+    if isinstance(parsed, dict):
+        entries = [parsed]
+    elif isinstance(parsed, list):
+        entries = [p for p in parsed if isinstance(p, dict)]
+        if not entries:
+            print(f"[브레인화 nl 실패] LLM 응답이 빈 list: {out[:300]}")
+            return 0
+    else:
+        print(f"[브레인화 nl 실패] 예상치 못한 응답 형식: {type(parsed).__name__}")
+        return 0
+
+    last_rc = 0
+    for entry in entries:
+        action = entry.get("action", "")
+        args = entry.get("args") or {}
+        if action == "error":
+            print(f"[브레인화 nl] 해석 실패: {entry.get('reason','(이유 없음)')}")
+            return 0
+        last_rc = _nl_dispatch_one(state, now, item, action, args)
+        if last_rc != 0:
+            return last_rc
+    return last_rc
 
 
 def cmd_cancel(state: dict, now: dt.datetime) -> int:
@@ -1848,7 +2697,7 @@ def cmd_status(state: dict, now: dt.datetime) -> int:
 def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     """1. Gates → 통과해야 발화.
        2. Snooze → 활성 시 침묵.
-       3. fetch unread → classify → merge into pending plan.
+       3. fetch inbox pending → classify → merge into pending plan.
        4. plan 의 msg_id set 가 마지막 발화 set 와 다르면 발화."""
     if not force:
         gate_fail = check_gates(now)
@@ -1862,7 +2711,7 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
             save_state(state)
             return 0
 
-    emails = fetch_unread_all()
+    emails = fetch_inbox_pending()
     if emails is None:
         print("[gws-assistant] gmail fetch 실패 (gog OAuth?)", file=sys.stderr)
         emails = []
@@ -1898,9 +2747,507 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     return 0
 
 
+def cmd_pending_review(state: dict, now: dt.datetime, batch_size: int = GMAIL_MAX) -> int:
+    """'브레인화/보류' 라벨 메일을 batch_size 건 가져와 라벨 제거 후 일반 plan flow 로
+    재분류·재처리. 사용자가 외부 작업/숙고 후 보류 박스를 정리할 때 진입점.
+    활성 plan 이 있으면 거부 — 폴링 plan 과 보류 정리 plan 의 혼선을 막기 위함."""
+    if state.get("pending_plan"):
+        print("[브레인화 보류 정리] 활성 plan 이 있습니다 — 먼저 처리 또는 /g 취소 후 재시도하세요.")
+        return 0
+
+    mails = fetch_pending_labeled(batch_size)
+    if mails is None:
+        print("[브레인화 보류 정리] gmail fetch 실패 (gog OAuth?)", file=sys.stderr)
+        return 1
+    if not mails:
+        print("[브레인화 보류 정리] 보류 라벨 메일이 없습니다. 정리 완료.")
+        return 0
+
+    cleaned: list[dict] = []
+    fail_count = 0
+    for m in mails:
+        mid = m.get("id") or ""
+        if not mid:
+            fail_count += 1
+            continue
+        ok, _err = gog_call("gmail", "labels", "modify", mid, "--remove", LABEL_PENDING)
+        if ok:
+            cleaned.append(m)
+        else:
+            fail_count += 1
+
+    if not cleaned:
+        print(f"[브레인화 보류 정리] 라벨 제거 모두 실패 ({fail_count}건). 정리 중단.")
+        return 0
+
+    plan = merge_plan(state, cleaned, now)
+    current_ids = sorted({it["msg_id"] for it in plan.get("items", []) if it.get("msg_id")})
+    plan["last_announced_msg_ids"] = current_ids
+
+    state["pending_plan"] = plan if current_ids else None
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+
+    head_lines = [f"[브레인화 보류 정리] {len(cleaned)}건 라벨 제거 후 재분류했습니다."]
+    if fail_count:
+        head_lines.append(f"  · 라벨 제거 실패 {fail_count}건 스킵")
+    head_lines.append("")
+    head = "\n".join(head_lines)
+
+    msg = format_plan_message(
+        now, plan, new_count=len(current_ids), total_count=len(current_ids),
+    )
+    print(head + msg)
+    return 0
+
+
 # ============================================================================
 # Main / arg parsing
 # ============================================================================
+
+# ============================================================================
+# Correction log — 사용자 피드백을 vault gmail-capture.md 에 누적,
+# 다음 LLM 분류 시 프롬프트로 자동 주입되어 자기진화.
+# ============================================================================
+
+def _append_correction_log(now: dt.datetime, frm: str, subject: str,
+                            old_cat: str, new_cat: str, memo: str) -> bool:
+    """vault gmail-capture.md 의 교정 로그 marker 사이에 한 줄 append. True on success."""
+    safe_subject = (subject or "").replace("\n", " ").replace("\r", "").strip()[:80]
+    safe_from = (frm or "").replace("\n", " ").strip()[:80]
+    line = (f"- {now.strftime('%Y-%m-%d')}: from={safe_from}, "
+            f"subject=\"{safe_subject}\": {old_cat or '?'}→{new_cat}")
+    if memo:
+        line += f" ({memo})"
+    try:
+        text = VAULT_CAPTURE_DOC.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    start_marker = "<!-- correction-log-start -->"
+    end_marker = "<!-- correction-log-end -->"
+    s = text.find(start_marker)
+    e = text.find(end_marker)
+    if s < 0 or e < 0 or s > e:
+        return False
+    s_end = s + len(start_marker)
+    inner = text[s_end:e].rstrip()
+    new_inner = inner + "\n" + line + "\n"
+    new_text = text[:s_end] + new_inner + text[e:]
+    try:
+        VAULT_CAPTURE_DOC.write_text(new_text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def cmd_reclassify(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 plan 안의 item 의 category 만 in-place 로 변경.
+    Gmail 라벨은 안 건드림 — 다음 approve 시 새 category 로 처리되어
+    proceed 면 propose+note 흐름까지 정상적으로 돌아감.
+    plan 외 메일은 cmd_correct 를 쓸 것."""
+    if len(argv) < 2:
+        print("[브레인화 재분류] thread_id 와 new_category 필요.")
+        return 1
+    tid = argv[0]
+    new_cat = argv[1].lower()
+    memo = " ".join(argv[2:]).strip() if len(argv) > 2 else ""
+
+    if new_cat not in VALID_CATEGORIES:
+        print(f"[브레인화 재분류] 알 수 없는 카테고리 '{new_cat}'.")
+        return 1
+
+    plan = state.get("pending_plan")
+    if not plan:
+        print("[브레인화 재분류] 활성 plan 없음. 먼저 폴링 발화 필요.")
+        return 1
+
+    item = _find_item_by_thread(plan, tid)
+    if not item:
+        print(f"[브레인화 재분류] thread_id '{tid}' 가 현재 plan 에 없습니다.")
+        print("    plan 외 후처리 교정은 'correct' 명령 사용.")
+        return 1
+
+    old_cat = item.get("category")
+    if old_cat == new_cat:
+        print(f"[브레인화 재분류] 이미 '{new_cat}' 입니다. 변경 없음.")
+        return 0
+
+    item["category"] = new_cat
+    item["action"] = make_action(new_cat)
+    item["reason"] = (f"사용자 재분류: {old_cat}→{new_cat}"
+                      + (f" ({memo})" if memo else ""))
+    if new_cat == "proceed":
+        item["confirm_status"] = "pending_review"
+        item.setdefault("note_path", None)
+        item.setdefault("proposed_para_path", None)
+        item.setdefault("proposed_links", [])
+        item.setdefault("body_summary", "")
+        item.setdefault("attachments", [])
+    else:
+        item["confirm_status"] = None
+
+    plan["items"] = sort_plan_items(plan.get("items", []))
+    save_state(state)
+
+    log_ok = _append_correction_log(
+        now, item.get("from", ""), item.get("subject", ""),
+        old_cat, new_cat, memo or "in-plan reclassify"
+    )
+
+    out = [
+        f"[브레인화 재분류] {_short_subject(item.get('subject',''), 50)}",
+        f"  → category {old_cat} → {new_cat} (plan 내부, Gmail 라벨은 아직 변화 없음)",
+        f"  → 다음 /g 맞아 (approve) 시 새 category 로 처리됨",
+    ]
+    if new_cat == "proceed":
+        out.append(f"  → approve 후 propose 큐에 들어가 1건 검토 대상이 됨")
+    if log_ok:
+        out.append("  → vault 교정 로그에도 기록 (학습 데이터)")
+    if memo:
+        out.append(f"  → 메모: {memo}")
+    print("\n".join(out))
+    return 0
+
+
+def cmd_done(state: dict, now: dt.datetime, thread_id: str) -> int:
+    """진행 라벨 메일을 완료 라벨로 promote — 후속 작업 종결 선언.
+    `브레인화/진행` 제거 + `브레인화/완료` 추가. archive 상태는 유지 (이미 archived).
+    plan 외 동작 — confirmed 후 후속 마무리 단계의 메일 대상."""
+    if not thread_id:
+        print("[브레인화 완료] thread_id 가 필요합니다.")
+        return 1
+    ok, err = gog_call(
+        "gmail", "labels", "modify", thread_id,
+        "--add", LABEL_DONE,
+        "--remove", LABEL_PROCEED,
+    )
+    if not ok:
+        print(f"[브레인화 완료] 라벨 변경 실패: {err}")
+        return 1
+    print(f"[브레인화 완료] {thread_id} → '{LABEL_DONE}' (라벨 '{LABEL_PROCEED}' 제거).")
+    return 0
+
+
+def cmd_in_progress_list(state: dict, now: dt.datetime, limit: int = GMAIL_MAX) -> int:
+    """'브레인화/진행' 라벨 메일 backlog 표시. 사용자가 각각 /g 완료 <id> 로 promote 가능.
+    plan 과 무관 — Gmail 검색 결과만 표시."""
+    mails = fetch_in_progress_labeled(limit)
+    if mails is None:
+        print("[브레인화 진행 목록] gmail fetch 실패 (gog OAuth?)", file=sys.stderr)
+        return 1
+    if not mails:
+        print("[브레인화 진행 목록] 진행 라벨 메일이 없습니다. 정리 완료.")
+        return 0
+
+    L = [f"[브레인화 진행 라벨 메일 {len(mails)}건] (요청 limit={limit})", ""]
+    for i, m in enumerate(mails, 1):
+        mid = m.get("id", "")
+        subj = m.get("subject", "(제목 없음)")
+        frm = m.get("from", "")
+        date = m.get("date", "")
+        L.append(f"{i}. [{mid}] {date}  {frm}")
+        L.append(f"   제목: {subj}")
+        L.append("")
+    L.append("[명령]")
+    L.append("  /g 완료 <thread_id>          — 1건 promote (진행 → 완료)")
+    L.append("  /gws-assistant done-bulk <id1> <id2> …  — 다수 promote (또는 'all' 키워드로 위 전체)")
+    L.append("  /g 진행 목록 [N]             — 다음 N건 (반복으로 backlog 비우기)")
+    print("\n".join(L))
+    return 0
+
+
+def cmd_done_bulk(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """다수 thread_id 를 일괄 promote (진행 → 완료). 'all' 키워드 시 위 검색 결과 전체.
+    argv: thread_id list, 또는 ['all'] (limit 안의 전체 promote)."""
+    if not argv:
+        print("[브레인화 일괄 완료] thread_id 리스트 또는 'all' 이 필요합니다.")
+        return 1
+
+    if argv[0].lower() == "all":
+        try:
+            limit = int(argv[1]) if len(argv) >= 2 else GMAIL_MAX
+        except ValueError:
+            limit = GMAIL_MAX
+        mails = fetch_in_progress_labeled(limit)
+        if mails is None:
+            print("[브레인화 일괄 완료] gmail fetch 실패.", file=sys.stderr)
+            return 1
+        thread_ids = [m.get("id", "") for m in mails if m.get("id")]
+    else:
+        thread_ids = list(argv)
+
+    if not thread_ids:
+        print("[브레인화 일괄 완료] 대상 thread_id 가 없습니다.")
+        return 0
+
+    ok_count = 0
+    fails: list[str] = []
+    for tid in thread_ids:
+        ok, err = gog_call(
+            "gmail", "labels", "modify", tid,
+            "--add", LABEL_DONE,
+            "--remove", LABEL_PROCEED,
+        )
+        if ok:
+            ok_count += 1
+        else:
+            fails.append(f"{tid[:12]}…: {err}")
+
+    out = [f"[브레인화 일괄 완료] {ok_count}/{len(thread_ids)}건 promote 됨 (진행 → 완료)."]
+    if fails:
+        out.append(f"  실패 {len(fails)}건:")
+        for f in fails:
+            out.append(f"    · {f}")
+    print("\n".join(out))
+    return 0
+
+
+def cmd_bulk_reclassify(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """plan 내 in-place 일괄 재분류. argv 는 '<thread_id>:<new_cat>' 토큰 list.
+    예: bulk-reclassify 19c5..ab:noise 19c5..cd:noise 19c5..ef:pending
+    한 번의 명령으로 다수 항목을 처리하고 결과 plan 을 한 번만 재출력 — 사용자가
+    plan 을 보면서 카테고리 위치를 통째로 정리할 때 사용. (Gmail 라벨은 안 건드림.)"""
+    plan = state.get("pending_plan")
+    if not plan:
+        print("[브레인화 일괄 재분류] 활성 plan 없음. 먼저 폴링 발화 필요.")
+        return 1
+    if not argv:
+        print("[브레인화 일괄 재분류] '<thread_id>:<new_cat>' 형식 토큰이 1개 이상 필요합니다.")
+        return 1
+
+    summary: list[str] = []
+    failed: list[str] = []
+    log_count = 0
+    for token in argv:
+        if ":" not in token:
+            failed.append(f"{token}: 형식 오류 (필요: <thread_id>:<new_cat>)")
+            continue
+        tid, new_cat = token.split(":", 1)
+        new_cat = new_cat.lower().strip()
+        if new_cat not in VALID_CATEGORIES:
+            failed.append(f"{tid}: 알 수 없는 카테고리 '{new_cat}'")
+            continue
+        item = _find_item_by_thread(plan, tid)
+        if not item:
+            failed.append(f"{tid}: plan 에 없음")
+            continue
+        old_cat = item.get("category")
+        if old_cat == new_cat:
+            continue
+        item["category"] = new_cat
+        item["action"] = make_action(new_cat)
+        item["reason"] = f"사용자 일괄 재분류: {old_cat}→{new_cat}"
+        if new_cat == "proceed":
+            item["confirm_status"] = "pending_review"
+            item.setdefault("note_path", None)
+            item.setdefault("proposed_para_path", None)
+            item.setdefault("proposed_links", [])
+            item.setdefault("body_summary", "")
+            item.setdefault("attachments", [])
+        else:
+            item["confirm_status"] = None
+        summary.append(f"{tid[:8]}…: {old_cat}→{new_cat}")
+        if _append_correction_log(
+            now, item.get("from", ""), item.get("subject", ""),
+            old_cat, new_cat, "bulk reclassify",
+        ):
+            log_count += 1
+
+    plan["items"] = sort_plan_items(plan.get("items", []))
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+
+    out: list[str] = []
+    if summary:
+        out.append(f"[브레인화 일괄 재분류] {len(summary)}건 적용:")
+        for s in summary:
+            out.append(f"  · {s}")
+        if log_count:
+            out.append(f"  → vault 교정 로그 {log_count}건 기록 (학습 데이터)")
+        out.append("")
+    if failed:
+        out.append(f"[실패 {len(failed)}건]")
+        for f in failed:
+            out.append(f"  · {f}")
+        out.append("")
+    if not summary and not failed:
+        out.append("[브레인화 일괄 재분류] 변경 없음 (모두 이미 같은 카테고리).")
+        out.append("")
+
+    items = plan.get("items", [])
+    # new_count=total_count 으로 두어 "(신규 N건 추가)" 노이즈 헤더 회피 — 재분류는 신규 메일 아님.
+    out.append(format_plan_message(
+        now, plan, new_count=len(items), total_count=len(items),
+    ))
+    print("\n".join(out))
+    return 0
+
+
+def cmd_correct(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """수동 교정. 라벨 재적용 + vault 교정 로그 append.
+    argv: [thread_id, new_category, memo_words...]"""
+    if len(argv) < 2:
+        print("[브레인화] correct 명령: thread_id 와 new_category 가 필요합니다.")
+        print("사용법: /gws-assistant correct <thread_id> <proceed|pending|noise> [메모]")
+        return 1
+
+    thread_id = argv[0]
+    new_cat = argv[1].lower()
+    memo = " ".join(argv[2:]).strip() if len(argv) > 2 else ""
+
+    if new_cat not in VALID_CATEGORIES:
+        print(f"[브레인화] 알 수 없는 카테고리 '{new_cat}'. "
+              f"proceed|pending|noise 중 하나여야 함.")
+        return 1
+
+    thread_data = gog_json("gmail", "thread", "get", thread_id)
+    if not thread_data:
+        print(f"[브레인화 교정] thread '{thread_id}' fetch 실패 "
+              f"(id 잘못됐거나 권한 없음).")
+        return 1
+
+    msgs = (thread_data.get("thread") or {}).get("messages") or thread_data.get("messages") or []
+    if not msgs:
+        print(f"[브레인화 교정] thread '{thread_id}' 에 messages 없음.")
+        return 1
+    first = msgs[0]
+    headers = {(h.get("name") or "").lower(): (h.get("value") or "")
+               for h in (first.get("payload") or {}).get("headers") or []}
+    frm = headers.get("from", "")
+    subject = headers.get("subject", "")
+
+    label_name = LABEL_PROCEED if new_cat == "proceed" else (
+        LABEL_PENDING if new_cat == "pending" else LABEL_NOISE
+    )
+    args = ["gmail", "labels", "modify", thread_id, "--add", label_name]
+    for other in [LABEL_PROCEED, LABEL_PENDING, LABEL_NOISE]:
+        if other != label_name:
+            args.extend(["--remove", other])
+    if new_cat in ("proceed", "noise"):
+        args.extend(["--remove", "INBOX"])
+
+    ok, err = gog_call(*args)
+    if not ok:
+        print(f"[브레인화 교정 실패] 라벨 적용 실패: {err}")
+        return 1
+
+    log_ok = _append_correction_log(now, frm, subject, "?", new_cat, memo)
+
+    out = [
+        f"[브레인화 교정] {_short_subject(subject, 50)}",
+        f"  → 라벨 '{label_name}'" + (" + archive" if new_cat in ("proceed", "noise")
+                                       else " (inbox 유지)"),
+    ]
+    if log_ok:
+        out.append("  → vault 교정 로그에 기록 — 다음 LLM 분류부터 학습 컨텍스트로 주입됨")
+    else:
+        out.append("  ⚠ vault 교정 로그 기록 실패 (marker 누락?)")
+    if memo:
+        out.append(f"  → 메모: {memo}")
+    print("\n".join(out))
+
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+_LEARN_RULES_LINE_RE = re.compile(
+    r"^- \d{4}-\d{2}-\d{2}: from=(.+?),\s+subject=\"[^\"]*\":\s*[^→]*→(\w+)"
+)
+_EMAIL_ADDR_RE = re.compile(r"<([^>]+)>")
+
+
+def cmd_learn_rules(state: dict, now: dt.datetime, threshold: int = 2) -> int:
+    """vault 교정 로그를 분석해 발신자별 deterministic 규칙 자동 추출.
+    같은 발신자 주소가 threshold 회 이상 같은 카테고리로 교정됐으면 등록.
+    여러 카테고리로 갈리면 (갈등) 등록 보류."""
+    try:
+        text = VAULT_CAPTURE_DOC.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"[learn-rules] vault 읽기 실패: {e}")
+        return 1
+    s = text.find("<!-- correction-log-start -->")
+    e_idx = text.find("<!-- correction-log-end -->")
+    if s < 0 or e_idx < 0 or s > e_idx:
+        print("[learn-rules] 교정 로그 marker 없음.")
+        return 1
+    log_text = text[s + len("<!-- correction-log-start -->"): e_idx]
+
+    counts: dict[str, dict[str, int]] = {}
+    total_lines = 0
+    for line in log_text.splitlines():
+        m = _LEARN_RULES_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        total_lines += 1
+        frm_raw = m.group(1).strip()
+        cat = m.group(2).strip().lower()
+        em = _EMAIL_ADDR_RE.search(frm_raw)
+        addr = em.group(1).lower() if em else frm_raw.strip().strip("\"'").lower()
+        if not addr or cat not in VALID_CATEGORIES:
+            continue
+        counts.setdefault(addr, {})
+        counts[addr][cat] = counts[addr].get(cat, 0) + 1
+
+    rules = load_deterministic_rules()
+    promoted: list[tuple[str, str, int]] = []
+    skipped: list[tuple[str, str]] = []
+    for addr, cat_counts in counts.items():
+        if len(cat_counts) > 1:
+            skipped.append((addr, f"갈등 ({cat_counts})"))
+            continue
+        cat, n = next(iter(cat_counts.items()))
+        if n < threshold:
+            skipped.append((addr, f"{cat} {n}회 (threshold {threshold} 미달)"))
+            continue
+        existing = rules.get(addr)
+        if existing and existing.get("category") == cat and existing.get("source_corrections", 0) >= n:
+            continue
+        rules[addr] = {
+            "category": cat,
+            "added_at": now.isoformat(),
+            "source_corrections": n,
+        }
+        promoted.append((addr, cat, n))
+
+    save_deterministic_rules(rules)
+
+    L = [
+        f"[learn-rules] 교정 로그 분석 — {total_lines}개 entry, threshold {threshold}회.",
+    ]
+    if promoted:
+        L.append(f"  새/갱신된 규칙 {len(promoted)}개:")
+        for addr, cat, n in promoted:
+            L.append(f"    + {addr} → {cat} ({n}회 누적)")
+    else:
+        L.append("  새 규칙 없음 (이미 모두 반영됨).")
+    if skipped:
+        L.append(f"  대기 {len(skipped)}개 (threshold 미달 또는 갈등):")
+        for addr, why in skipped[:10]:
+            L.append(f"    - {addr}: {why}")
+        if len(skipped) > 10:
+            L.append(f"    ... 외 {len(skipped) - 10}개")
+    L.append(f"  활성 규칙 총 {len(rules)}개 ({DETERMINISTIC_RULES_PATH})")
+    print("\n".join(L))
+    return 0
+
+
+def cmd_show_rules(state: dict, now: dt.datetime) -> int:
+    """현재 활성 deterministic 규칙 표시."""
+    rules = load_deterministic_rules()
+    if not rules:
+        print("[show-rules] 활성 deterministic 규칙 없음. /gws-assistant learn-rules 로 교정 로그에서 학습.")
+        return 0
+    L = [f"[show-rules] 활성 deterministic 규칙 {len(rules)}개:"]
+    for addr, info in sorted(rules.items()):
+        cat = info.get("category", "?")
+        n = info.get("source_corrections", "?")
+        added = info.get("added_at", "")[:10]
+        L.append(f"  {addr} → {cat} ({n}회, {added})")
+    L.append(f"\n파일: {DETERMINISTIC_RULES_PATH}")
+    print("\n".join(L))
+    return 0
+
 
 def main(argv: list[str]) -> int:
     state = load_state()
@@ -1913,6 +3260,14 @@ def main(argv: list[str]) -> int:
             return cmd_approve(state, now)
         if first == "cancel":
             return cmd_cancel(state, now)
+        if first == "correct":
+            return cmd_correct(state, now, argv[1:])
+        if first == "reclassify":
+            return cmd_reclassify(state, now, argv[1:])
+        if first == "learn-rules":
+            return cmd_learn_rules(state, now)
+        if first == "show-rules":
+            return cmd_show_rules(state, now)
         if first == "snooze":
             try:
                 minutes = int(argv[1]) if len(argv) >= 2 else 60
@@ -1923,20 +3278,51 @@ def main(argv: list[str]) -> int:
         if first == "status":
             return cmd_status(state, now)
         if first == "confirm":
-            if len(argv) < 2:
-                print("[브레인화] confirm 명령에는 thread_id 가 필요합니다.")
-                return 1
-            return cmd_confirm(state, now, argv[1])
+            return cmd_confirm(state, now, argv[1] if len(argv) >= 2 else None)
         if first == "edit":
             return cmd_edit(state, now, argv[1:])
         if first == "skip":
-            if len(argv) < 2:
-                print("[브레인화] skip 명령에는 thread_id 가 필요합니다.")
-                return 1
-            return cmd_skip(state, now, argv[1])
+            return cmd_skip(state, now, argv[1] if len(argv) >= 2 else None)
+        if first == "dismiss":
+            return cmd_dismiss(state, now, argv[1] if len(argv) >= 2 else None)
+        if first == "draft-reply":
+            return cmd_draft_reply(state, now, argv[1:])
+        if first == "schedule":
+            return cmd_schedule(state, now, argv[1:])
+        if first == "replied":
+            return cmd_replied(state, now, argv[1:])
+        if first == "todo":
+            return cmd_todo(state, now, argv[1:])
+        if first == "nl":
+            return cmd_nl(state, now, argv[1:])
         if first == "migrate-inbox":
             apply = "--apply" in argv[1:]
             return cmd_migrate_inbox(state, now, apply=apply)
+        if first == "pending-review":
+            bs = GMAIL_MAX
+            if len(argv) >= 2:
+                try:
+                    bs = max(1, int(argv[1]))
+                except ValueError:
+                    pass
+            return cmd_pending_review(state, now, batch_size=bs)
+        if first == "bulk-reclassify":
+            return cmd_bulk_reclassify(state, now, argv[1:])
+        if first == "done":
+            if len(argv) < 2:
+                print("[브레인화 완료] thread_id 가 필요합니다.")
+                return 1
+            return cmd_done(state, now, argv[1])
+        if first == "in-progress-list":
+            bs = GMAIL_MAX
+            if len(argv) >= 2:
+                try:
+                    bs = max(1, int(argv[1]))
+                except ValueError:
+                    pass
+            return cmd_in_progress_list(state, now, limit=bs)
+        if first == "done-bulk":
+            return cmd_done_bulk(state, now, argv[1:])
         if first == "--force-poll" or first == "--force-batch":
             return cmd_poll(state, now, force=True)
         # unknown — fall through to poll
