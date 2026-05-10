@@ -3,10 +3,11 @@
 !.openclaw/workspace-state.json
 state/
 
-# Python bytecode
+# Python bytecode + venv
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # OS / editor
 .DS_Store

@@ -1,0 +1,12 @@
+[project]
+name = "webmail-watch"
+version = "0.1.0"
+description = "외부 forwarding/IMAP 차단된 webmail polling → webmail UI 전달 click-driven re-forward"
+requires-python = ">=3.11"
+dependencies = [
+    "pyotp>=2.9",
+    "playwright>=1.45",
+]
+
+[tool.uv]
+package = false
