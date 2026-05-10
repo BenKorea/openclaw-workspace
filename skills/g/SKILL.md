@@ -46,13 +46,17 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 에 forward.
 ## 지원 입력 예시 (참고용 — 강제 아님)
 
 ```
-# 검토 항목에 답할 때 (모두 즉시 종결 또는 자동 종결)
-/g 확정 (= ok)              — 노트 PARA 이동 + '브레인화/완료'
-/g 답장 [지시]              — Drafts 등록 + awaiting_reply (발송 자동 감지로 종결)
-/g 답장할일 [YYYY-MM-DD]    — 답장 + Google Tasks 등록
-/g 할일 [YYYY-MM-DD]        — Google Tasks 등록 + 즉시 종결
+# 검토 항목에 답할 때 (모두 즉시 종결 또는 자동 종결) — 7개 canonical 명령
+/g 확정 (= ok)                       — 노트 PARA 이동 + '브레인화/완료'
+/g 답장 (= reply)                    — Drafts 등록 + awaiting_reply (발송 자동 감지로 종결)
+/g 답장할일 [YYYY-MM-DD]             — 답장 + Google Tasks 등록 (마감일 인자/LLM 추출/없음)
+/g 할일 [YYYY-MM-DD] [note] (= task) — Google Tasks 등록 + 즉시 종결 (메모는 Tasks notes 에 append)
 /g 경로수정 folder=knowledge/02_areas/grants/ — PARA 변경 + 즉시 종결
-/g 보류 / /g 불필요          — 보류/폐기
+/g 보류                              — 노트 삭제 + 보류 라벨 (inbox 유지)
+/g 불필요                            — 노트 삭제 + 불필요 + archive
+
+# 위 표는 도움말용 canonical 만 노출. 파서는 더 많은 한국어/영어 alias 도 인식 —
+# 예/네/맞아/좋아/승인/confirm/approve, skip/나중에, 폐기/dismiss, reply-task 등.
 
 # plan/분류 일괄
 /g 맞아                     — 현재 plan 일괄 처리 (= /gws-assistant approve)

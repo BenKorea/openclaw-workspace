@@ -177,8 +177,8 @@ PATTERNS_FAST = [
     ("reply",           re.compile(r"^(?:답장|reply)(?:\s+(.+))?$", re.IGNORECASE)),
     # 답장할일 — 답장 + Google Tasks 등록 (마감일 인자 또는 LLM 추출 또는 None).
     ("reply_task",      re.compile(r"^(?:답장할일|reply[-_\s]?task)(?:\s+(.+))?$", re.IGNORECASE)),
-    # 할일 — Google Tasks 등록만 + 즉시 종결.
-    ("task",            re.compile(r"^(?:할일|task)(?:\s+(\d{4}-\d{2}-\d{2}))?\s*$", re.IGNORECASE)),
+    # 할일 — Google Tasks 등록만 + 즉시 종결. 인자: [YYYY-MM-DD] [note...] (둘 다 선택).
+    ("task",            re.compile(r"^(?:할일|task)(?:\s+(.+))?$", re.IGNORECASE)),
     # 경로수정 — PARA 폴더 변경 + 즉시 종결 (재확인 없음).
     ("relocate",        re.compile(r"^(?:경로\s*수정|경로수정|relocate)(?:\s+(.+))?$", re.IGNORECASE)),
     # id 있음 — 다른 메일 후처리 교정 (correct/reclassify, 컨텍스트 자동 분기)
@@ -225,8 +225,8 @@ def tier1_parse(text: str) -> tuple[str, list[str]] | None:
             raw = (m.group(1) or "").strip()
             return ("reply_task", raw.split() if raw else [])
         if action_type == "task":
-            due = (m.group(1) or "").strip()
-            return ("task", [due] if due else [])
+            raw = (m.group(1) or "").strip()
+            return ("task", raw.split() if raw else [])
         if action_type == "relocate":
             raw = (m.group(1) or "").strip()
             return ("relocate", raw.split() if raw else [])
@@ -443,16 +443,17 @@ HELP_TEXT = """[g] Gmail/gws-assistant 자연어 entry point.
 사용법: /g <한국어 텍스트>
 
 bot 의 propose (1건 검토 요청) 에 답할 때 (모두 즉시 종결 또는 자동 종결):
-  /g 확정 (= ok/예/네/맞아/좋아/승인/confirm/approve) — 노트 PARA 이동 + 라벨 '브레인화/완료'
-  /g 답장 [지시…]                  — vault+Gmail 검색 → Drafts → awaiting_reply 큐.
-                                     발송 자동 감지 시 '브레인화/완료' 로 promote.
-  /g 답장할일 [YYYY-MM-DD] [지시…] — 답장 + Google Tasks 등록 (마감일 인자/LLM 추출/없음)
-  /g 할일 [YYYY-MM-DD]             — Google Tasks 등록만 + 즉시 종결
-  /g 경로수정 folder=<경로>        — PARA 폴더 변경 + 즉시 종결 (재확인 없음)
-  /g 보류 (= 스킵/skip/나중에)      — 노트 삭제 + 보류 라벨 (inbox 유지) / plan 단위 시 60분 snooze
-  /g 불필요 (= 폐기/dismiss)        — 노트 삭제 + 불필요 + archive
+  /g 확정 (= ok)                       — 노트 PARA 이동 + 라벨 '브레인화/완료'
+  /g 답장 (= reply)                    — vault+Gmail 검색 → Drafts → awaiting_reply 큐.
+                                         발송 자동 감지 시 '브레인화/완료' 로 promote.
+  /g 답장할일 [YYYY-MM-DD]             — 답장 + Google Tasks 등록 (마감일 인자/LLM 추출/없음)
+  /g 할일 [YYYY-MM-DD] [note] (= task) — Google Tasks 등록만 + 즉시 종결
+  /g 경로수정 folder=<경로>            — PARA 폴더 변경 + 즉시 종결 (재확인 없음)
+  /g 보류                              — 노트 삭제 + 보류 라벨 (inbox 유지) / plan 단위 시 60분 snooze
+  /g 불필요                            — 노트 삭제 + 불필요 + archive
 
-(컨텍스트 자동 인식 — 개별 review 대기 있으면 그 항목 적용, 없으면 plan 단위 동작)
+(컨텍스트 자동 인식 — 개별 review 대기 있으면 그 항목 적용, 없으면 plan 단위 동작.
+ 표시되지 않은 한국어/영어 alias 도 파서는 동일하게 인식 — 예/네/맞아/skip/dismiss 등.)
 
 id 와 함께 (다른 메일 후처리 교정):
   /g 진행 19c55ca2baf47bdb         — plan 안: category 변경 / plan 밖: 라벨 교정

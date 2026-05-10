@@ -711,31 +711,19 @@ def format_plan_message(now: dt.datetime, plan: dict, new_count: int, total_coun
                 L.append(f"   분류 사유: {it['reason']}")
             L.append("")
 
-    proceed_header = (
-        f"▸ 진행 {n_proceed}건 — 거래·증빙성 메일 (audit trail 가치). approve 시 본문 fetch → "
-        f"동반 노트 작성(PARA 위치·연결 후보 LLM 추론 포함) → **1건씩 보고드린 뒤 승인 받음**."
-    )
-    pending_header = (
-        f"▸ 보류 {n_pend}건 — 외부 다운로드·후속 행동 필요 또는 분류 자신없음. approve 시 라벨 "
-        f"'{LABEL_PENDING}' 만 부착하고 inbox 유지. Ben 외부 작업 후 별도 brainify."
-    )
-    noise_header = (
-        f"▸ 불필요 {n_noise}건 — 광고·뉴스레터·자동 알림·중복. approve 시 라벨 "
-        f"'{LABEL_NOISE}' + archive."
-    )
+    proceed_header = f"▸ 진행 {n_proceed}건"
+    pending_header = f"▸ 보류 {n_pend}건"
+    noise_header = f"▸ 불필요 {n_noise}건"
 
     emit_section(proceed_header, by_cat.get("proceed", []))
     emit_section(pending_header, by_cat.get("pending", []))
     emit_section(noise_header, by_cat.get("noise", []))
 
     L.append("[명령]")
-    L.append("  /g 승인  (= 진행 / 확정 / 예 / 네 / 맞아 / 좋아 / OK / confirm / approve)")
-    L.append("           — 보류·불필요 일괄 처리 + 진행 1건씩 검토 시작")
-    L.append("  /g 재분류 진행1/불필요 보류2/진행 …  — plan 내 위치 기반 재분류 후 다시 검토")
-    L.append("  /g 취소  (= cancel)        — plan 폐기, 다음 폴링에서 새로 분류")
-    L.append("  /g 보류  (= 스킵 / skip / 나중에)  — 60분 발화 보류 (snooze)")
-    L.append("")
-    L.append("(진행 항목은 승인 후 1건씩 보고됩니다 — 각 보고에 /g 확정 · /g 편집 · /g 스킵 · /g 불필요 가 함께 옵니다.)")
+    L.append("  /g 승인 (=ok)")
+    L.append("  /g 재분류 진행1/불필요 보류2/진행 …")
+    L.append("  /g 취소 (=cancel)")
+    L.append("  /g 보류 (=skip) - 60분 발화 보류")
     L.append("")
     L.append(f"[plan id] {plan.get('plan_id', '')}")
     L.append(f"[처리 시각] {now.isoformat()}")
@@ -1613,24 +1601,14 @@ def format_proposal_message(now: dt.datetime, item: dict, idx: int, total: int) 
             else:
                 L.append(f"  · {kind} [{fl.get('at','')}]")
     L.append("")
-    tid = item.get("msg_id", "")
-    L.append("[명령]")
-    L.append(f"  /gws-assistant confirm {tid}")
-    L.append(f"      → 그대로 확정 (라벨 '{LABEL_PROCEED}' + archive)")
-    L.append(f"  /gws-assistant edit {tid} folder=<경로> links=<[[A]],[[B]]>")
-    L.append(f"      → PARA 위치/연결 수정 후 확정")
-    L.append(f"  /gws-assistant skip {tid}")
-    L.append(f"      → 이 메일 건너뛰기 (라벨 '{LABEL_PENDING}', inbox 유지, 노트 정리)")
-    L.append("[후속조치 (선택, 누적 가능)]")
-    L.append(f"  /gws-assistant draft-reply {tid} [톤·요지]")
-    L.append(f"      → Opus 회신 초안 → Gmail Drafts 등록 (발송 안 함)")
-    L.append(f"  /gws-assistant schedule {tid} when=YYYY-MM-DD HH:MM "
-             f"[duration=60] [summary=…]")
-    L.append(f"      → Calendar primary 에 이벤트 생성")
-    L.append(f"  /gws-assistant replied {tid} [요약]")
-    L.append(f"      → 이미 회신했음을 노트에 기록")
-    L.append(f"  /gws-assistant todo {tid} <할일>")
-    L.append(f"      → 노트 '## 후속 액션' 섹션에 - [ ] 라인 추가")
+    L.append("[명령]  (하나만 선택 — 1단계 종결)")
+    L.append(f"  /g 확정                              → PARA 이동 + '{LABEL_DONE}' + archive (즉시 종결)")
+    L.append(f"  /g 답장 [톤·요지]                    → Drafts 등록 + '{LABEL_PROCEED}' + awaiting_reply (발송 감지 시 종결)")
+    L.append("  /g 답장할일 [YYYY-MM-DD] [지시]      → 답장 + Google Tasks 등록")
+    L.append("  /g 할일 [YYYY-MM-DD] [note]         → Google Tasks 등록만 + 즉시 종결")
+    L.append("  /g 경로수정 folder=<경로>            → PARA 폴더 변경 + 즉시 종결 (재확인 없음)")
+    L.append(f"  /g 보류                              → 노트 삭제 + '{LABEL_PENDING}' (inbox 유지)")
+    L.append(f"  /g 불필요                            → 노트 삭제 + '{LABEL_NOISE}' + archive")
     return "\n".join(L)
 
 
@@ -2332,16 +2310,21 @@ def _attach_gtask_to_note(item: dict, gtask_id: str, due_date: str | None) -> No
 
 def cmd_gtask(state: dict, now: dt.datetime, argv: list[str]) -> int:
     """현재 review 항목을 Google Tasks 에 등록 + 즉시 완료 (LABEL_DONE).
-    Usage: gtask [thread_id] [YYYY-MM-DD]
+    Usage: gtask [thread_id] [YYYY-MM-DD] [note...]
         thread_id 생략 시 단일 pending_review 자동 보강.
-        YYYY-MM-DD 생략 시 본문에서 LLM 추출, 추출 실패 시 마감 없이 등록 (묻지 않음)."""
+        YYYY-MM-DD 생략 시 본문에서 LLM 추출, 추출 실패 시 마감 없이 등록 (묻지 않음).
+        나머지 토큰들은 자유 메모로 묶여 Google Tasks notes 끝에 'Note: …' 로 append."""
     thread_id: str | None = None
     user_due: str | None = None
+    note_extra_tokens: list[str] = []
     for a in argv:
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a):
             user_due = a
-        elif re.fullmatch(r"[0-9a-fA-F]{8,}", a):
+        elif thread_id is None and re.fullmatch(r"[0-9a-fA-F]{8,}", a):
             thread_id = a
+        else:
+            note_extra_tokens.append(a)
+    note_extra = " ".join(note_extra_tokens).strip()
 
     plan = state.get("pending_plan")
     item, err = _resolve_pending_review_thread(plan, thread_id)
@@ -2358,6 +2341,8 @@ def cmd_gtask(state: dict, now: dt.datetime, argv: list[str]) -> int:
         f"Thread: https://mail.google.com/mail/u/0/#inbox/{msg_id}\n"
         f"Vault: {item.get('note_path', '')}"
     )
+    if note_extra:
+        notes += f"\n\nNote: {note_extra}"
     gtask_id = create_gtask(state, title, notes, due_date=actual_due)
     if not gtask_id:
         print("[브레인화 할일 실패] Google Tasks 생성 실패. 큐 상태 유지.")
@@ -2377,10 +2362,12 @@ def cmd_gtask(state: dict, now: dt.datetime, argv: list[str]) -> int:
     para = item.get("proposed_para_path") or "sources/00_inbox/"
     residual = _count_pending_review(plan)
     due_msg = f" (마감 {actual_due})" if actual_due else " (마감 없음)"
+    note_line = f"  · 메모: {note_extra}\n" if note_extra else ""
     header = (
         safety
         + f"[브레인화 할일] {_short_subject(item.get('subject',''), 40)}{due_msg}\n"
         + f"  · Google Tasks 등록 (gtask_id={gtask_id})\n"
+        + note_line
         + f"  · 노트 위치 {para}, 라벨 '{LABEL_DONE}' + archive\n"
         + f"  · 잔여 review 대기 {residual}건\n\n"
     )

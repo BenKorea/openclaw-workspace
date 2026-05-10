@@ -24,7 +24,7 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | `/gws-assistant dismiss [thread_id]` | `python3 … run.py dismiss [thread_id]` |
 | `/gws-assistant reply [thread_id] [지시]` | `python3 … run.py reply [thread_id] [지시]` (vault+Gmail 검색 → Drafts → awaiting_reply 큐) |
 | `/gws-assistant reply-task [thread_id] [YYYY-MM-DD] [지시]` | `python3 … run.py reply-task …` (reply + Google Tasks 등록 합성) |
-| `/gws-assistant gtask [thread_id] [YYYY-MM-DD]` | `python3 … run.py gtask …` (Google Tasks 등록 + 즉시 종결) |
+| `/gws-assistant gtask [thread_id] [YYYY-MM-DD] [note...]` | `python3 … run.py gtask …` (Google Tasks 등록 + 즉시 종결, note 토큰은 Tasks notes 에 append) |
 | `/gws-assistant nl [thread_id] <자연어 문장>` | `python3 … run.py nl [thread_id] <자연어…>` (Opus 4.7 → 3종 명령 reply/reply-task/task 변환) |
 | `/gws-assistant correct <thread_id> <proceed\|pending\|noise> [메모]` | `python3 … run.py correct …` |
 | `/gws-assistant reclassify <thread_id> <new_cat> [메모]` | `python3 … run.py reclassify …` |
@@ -79,14 +79,16 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 1. `/gws-assistant approve` → `pending`/`noise` 일괄 라벨/archive. `proceed` 항목은 큐로 진입.
 2. 첫 `proceed` 항목 → 본문 fetch + Opus 4.7 동반 노트 작성 → vault `sources/00_inbox/` atomic write (staging) → **1건 보고만 (라벨/archive 안 함)**.
-3. 사용자가 보고에 다음 중 **하나**로 응답:
+3. 사용자가 보고에 다음 중 **하나**로 응답 (7개 canonical 명령):
    - **`/g 확정` (= ok)** — 노트 → `knowledge/<PARA>/`, 첨부 → `sources/<PARA>/`. 라벨 `브레인화/완료` + archive. **즉시 종결**.
-   - **`/g 답장 [지시]`** — vault + Gmail 같은 발신자 직전 thread 검색 → Opus 4.7 회신 초안 → Gmail Drafts 등록. 노트 PARA 이동. 라벨 `브레인화/진행` + archive. awaiting_reply 큐 push. **발송 자동 감지 시 종결**.
-   - **`/g 답장할일 [YYYY-MM-DD] [지시]`** — `/g 답장` + Google Tasks 등록 (마감일: 인자 → LLM 추출 → 마감 없음 순). 종결 트리거 동일 (발송 감지).
-   - **`/g 할일 [YYYY-MM-DD]`** — Google Tasks 등록만 + 즉시 종결.
+   - **`/g 답장` (= reply)** — vault + Gmail 같은 발신자 직전 thread 검색 → Opus 4.7 회신 초안 → Gmail Drafts 등록. 노트 PARA 이동. 라벨 `브레인화/진행` + archive. awaiting_reply 큐 push. **발송 자동 감지 시 종결**. 도움말상 인자 없음 — 추가 지시 토큰을 붙여도 파서는 받아 LLM 컨텍스트로 forward.
+   - **`/g 답장할일 [YYYY-MM-DD]`** — `/g 답장` + Google Tasks 등록 (마감일: 인자 → LLM 추출 → 마감 없음 순). 종결 트리거 동일 (발송 감지).
+   - **`/g 할일 [YYYY-MM-DD] [note]` (= task)** — Google Tasks 등록만 + 즉시 종결. note 토큰들은 Google Tasks notes 필드 끝에 `Note: …` 로 append.
    - **`/g 경로수정 folder=<경로>`** — PARA 폴더 변경 후 즉시 종결 (재확인 없음).
    - **`/g 보류`** — 노트 삭제 + 라벨 `브레인화/보류` (inbox 유지).
    - **`/g 불필요`** — 노트 삭제 + 라벨 `브레인화/불필요` + archive.
+
+   (도움말은 canonical 7개만 노출. 파서는 추가 한국어/영어 alias — 예/네/맞아/좋아/승인/confirm/approve, skip/나중에, 폐기/dismiss 등 — 도 동일하게 인식.)
 4. 다음 큐 1건 propose → 또 1건 보고. 큐 소진 시 완료 메시지.
 
 ### Google Tasks 통합
