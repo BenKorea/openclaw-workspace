@@ -720,10 +720,9 @@ def format_plan_message(now: dt.datetime, plan: dict, new_count: int, total_coun
     emit_section(noise_header, by_cat.get("noise", []))
 
     L.append("[명령]")
-    L.append("  /g 승인 (=ok)")
-    L.append("  /g 재분류 진행1/불필요 보류2/진행 …")
-    L.append("  /g 취소 (=cancel)")
-    L.append("  /g 보류 (=skip) - 60분 발화 보류")
+    L.append("  /g 1 (=승인)")
+    L.append("  /g 2 (=재분류)")
+    L.append("  /g 3 (=취소)")
     L.append("")
     L.append(f"[plan id] {plan.get('plan_id', '')}")
     L.append(f"[처리 시각] {now.isoformat()}")
@@ -1602,13 +1601,14 @@ def format_proposal_message(now: dt.datetime, item: dict, idx: int, total: int) 
                 L.append(f"  · {kind} [{fl.get('at','')}]")
     L.append("")
     L.append("[명령]  (하나만 선택 — 1단계 종결)")
-    L.append(f"  /g 확정                              → PARA 이동 + '{LABEL_DONE}' + archive (즉시 종결)")
-    L.append(f"  /g 답장 [톤·요지]                    → Drafts 등록 + '{LABEL_PROCEED}' + awaiting_reply (발송 감지 시 종결)")
-    L.append("  /g 답장할일 [YYYY-MM-DD] [지시]      → 답장 + Google Tasks 등록")
-    L.append("  /g 할일 [YYYY-MM-DD] [note]         → Google Tasks 등록만 + 즉시 종결")
-    L.append("  /g 경로수정 folder=<경로>            → PARA 폴더 변경 + 즉시 종결 (재확인 없음)")
-    L.append(f"  /g 보류                              → 노트 삭제 + '{LABEL_PENDING}' (inbox 유지)")
-    L.append(f"  /g 불필요                            → 노트 삭제 + '{LABEL_NOISE}' + archive")
+    L.append(f"  /g 1                              → 저장      (PARA 이동 + '{LABEL_DONE}' + archive)")
+    L.append(f"  /g 2 [톤·요지]                    → 답장      (Drafts + '{LABEL_PROCEED}' + awaiting_reply)")
+    L.append("  /g 3 [YYYY-MM-DD] [지시]          → 답장할일  (답장 + Google Tasks 등록)")
+    L.append("  /g 4 [YYYY-MM-DD] [메모]          → 할일      (Google Tasks 등록 + 즉시 종결)")
+    L.append("  /g 5 [YYYY-MM-DD HH:MM]           → 일정      (Google Calendar 등록 + 즉시 종결)")
+    L.append("  /g 6 <경로>                       → 경로수정  (PARA 폴더 변경 + 즉시 종결)")
+    L.append(f"  /g 보류                           → 노트 삭제 + '{LABEL_PENDING}' (inbox 유지)")
+    L.append(f"  /g 불필요                         → 노트 삭제 + '{LABEL_NOISE}' + archive")
     return "\n".join(L)
 
 
@@ -2368,6 +2368,254 @@ def cmd_gtask(state: dict, now: dt.datetime, argv: list[str]) -> int:
         + f"[브레인화 할일] {_short_subject(item.get('subject',''), 40)}{due_msg}\n"
         + f"  · Google Tasks 등록 (gtask_id={gtask_id})\n"
         + note_line
+        + f"  · 노트 위치 {para}, 라벨 '{LABEL_DONE}' + archive\n"
+        + f"  · 잔여 review 대기 {residual}건\n\n"
+    )
+    msg = _propose_next_or_complete(state, plan, now, header)
+    print(msg)
+    state["last_checked"] = now.isoformat()
+    save_state(state)
+    return 0
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _extract_schedule_from_email(item: dict, now: dt.datetime) -> dict | None:
+    """노트의 ## 요약 + 원본 메일에서 캘린더 이벤트 데이터 추출 (Opus 4.7).
+    Returns dict {summary, start, end, location, all_day} or None on failure.
+    start/end 는 RFC3339 (Asia/Seoul). all_day=True 면 start/end 는 'YYYY-MM-DD'."""
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return None
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return None
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    summary_section = _extract_summary_section(text, max_lines=30) or ""
+    body_section = ""
+    body_marker = text.find("## 원본 메일")
+    if body_marker >= 0:
+        body_section = text[body_marker: body_marker + 4000]
+
+    today_iso = now.date().isoformat()
+    prompt = (
+        f"오늘 날짜: {today_iso} (KST, +09:00)\n\n"
+        "다음 메일에서 캘린더 이벤트 1개를 추출하라. 명확한 시작 일시가 있어야 함.\n"
+        "- 시작·종료가 모두 시간 포함이면 RFC3339 (예: '2026-05-15T14:00:00+09:00').\n"
+        "- 시작은 있는데 종료 없음 → 종료는 시작 + 1시간.\n"
+        "- 시간 정보 없이 날짜만 → all_day=true, start/end='YYYY-MM-DD' (end 는 start 동일).\n"
+        "- 명확한 일시가 없거나 모호하면 null 반환.\n"
+        "- summary 는 한국어 한 줄. location 은 본문에 명시된 경우만 (없으면 빈 문자열).\n"
+        "응답은 JSON 객체 한 줄만. 다른 텍스트·코드블록·해설 금지.\n"
+        '예: {"summary":"학회 이사회","start":"2026-05-15T14:00:00+09:00",'
+        '"end":"2026-05-15T16:00:00+09:00","location":"서울대병원 의생명연구원","all_day":false}\n'
+        '추출 불가: {"event": null}\n\n'
+        f"[메일 제목] {item.get('subject', '')}\n"
+        f"[발신] {item.get('from', '')}\n"
+        f"[요약]\n{summary_section[:2500]}\n\n"
+        f"[본문 발췌]\n{body_section[:2500]}\n"
+    )
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-opus-4-7",
+        "--disallowedTools", "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    if out.startswith("```"):
+        nl = out.find("\n")
+        out = out[nl + 1:] if nl >= 0 else ""
+        if out.rstrip().endswith("```"):
+            out = out.rstrip()[:-3]
+        out = out.strip()
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        try:
+            s = out.index("{")
+            e = out.rindex("}") + 1
+            parsed = json.loads(out[s:e])
+        except (ValueError, json.JSONDecodeError):
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("event") is None and "start" not in parsed:
+        return None
+    start = parsed.get("start")
+    if not isinstance(start, str) or not start.strip():
+        return None
+    return {
+        "summary": (parsed.get("summary") or item.get("subject") or "").strip() or "(제목 없음)",
+        "start": start.strip(),
+        "end": (parsed.get("end") or start).strip(),
+        "location": (parsed.get("location") or "").strip(),
+        "all_day": bool(parsed.get("all_day")),
+    }
+
+
+def _parse_manual_schedule_args(argv: list[str], now: dt.datetime) -> dict | None:
+    """수동 인자 파싱: [YYYY-MM-DD] [HH:MM] [summary tokens…].
+    Returns dict 또는 None (날짜 토큰 없음 → LLM fallback)."""
+    date_str = None
+    time_str = None
+    rest: list[str] = []
+    for a in argv:
+        if date_str is None and _DATE_RE.match(a):
+            date_str = a
+        elif time_str is None and _TIME_RE.match(a):
+            time_str = a
+        else:
+            rest.append(a)
+    if not date_str:
+        return None
+    if time_str:
+        start = f"{date_str}T{time_str}:00+09:00"
+        try:
+            start_dt = dt.datetime.fromisoformat(start.replace("+09:00", ""))
+            end_dt = start_dt + dt.timedelta(hours=1)
+            end = end_dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+        except ValueError:
+            end = start
+        all_day = False
+    else:
+        start = date_str
+        end = date_str
+        all_day = True
+    return {
+        "summary": " ".join(rest).strip() or None,
+        "start": start,
+        "end": end,
+        "location": "",
+        "all_day": all_day,
+    }
+
+
+def _attach_schedule_to_note(item: dict, event_id: str, ev: dict) -> None:
+    """노트 frontmatter 에 calendar_event_id / calendar_start 기록 (best-effort)."""
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    text = _replace_fm_field(text, "calendar_event_id", event_id)
+    text = _replace_fm_field(text, "calendar_start", ev.get("start", ""))
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(note_path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, note_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
+
+
+def _create_calendar_event(ev: dict, thread_id: str, note_rel: str) -> tuple[str | None, str]:
+    """Google Calendar primary 에 이벤트 생성. Returns (event_id, error)."""
+    description = (
+        f"Gmail thread: https://mail.google.com/mail/u/0/#inbox/{thread_id}\n"
+        f"Vault note: {note_rel}"
+    )
+    args = [
+        "calendar", "create", "primary",
+        "--summary", ev.get("summary") or "(제목 없음)",
+        "--from", ev["start"],
+        "--to", ev.get("end") or ev["start"],
+        "--description", description,
+    ]
+    if ev.get("location"):
+        args.extend(["--location", ev["location"]])
+    if ev.get("all_day"):
+        args.append("--all-day")
+    out = gog_json(*args)
+    if isinstance(out, dict) and out.get("id"):
+        return (out["id"], "")
+    return (None, f"calendar create 응답 비정상: {out}")
+
+
+def cmd_schedule(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """현재 review 항목을 Google Calendar 에 일정으로 등록 + 즉시 완료 (LABEL_DONE).
+    Usage: schedule [thread_id] [YYYY-MM-DD] [HH:MM] [summary tokens…]
+        thread_id 생략 시 단일 pending_review 자동 보강.
+        날짜 토큰 생략 시 본문에서 Opus 4.7 추출, 실패 시 안내 후 중단 (큐 유지)."""
+    thread_id: str | None = None
+    remaining: list[str] = []
+    for a in argv:
+        if thread_id is None and re.fullmatch(r"[0-9a-fA-F]{8,}", a):
+            thread_id = a
+        else:
+            remaining.append(a)
+
+    plan = state.get("pending_plan")
+    item, err = _resolve_pending_review_thread(plan, thread_id)
+    if not item:
+        print(f"[브레인화] {err}")
+        return 0
+
+    ev = _parse_manual_schedule_args(remaining, now)
+    if ev is None:
+        ev = _extract_schedule_from_email(item, now)
+    elif not ev.get("summary"):
+        ev["summary"] = item.get("subject", "(제목 없음)") or "(제목 없음)"
+
+    if ev is None:
+        print(
+            "[브레인화 일정] 본문에서 명확한 일시를 찾지 못했습니다. "
+            "수동 인자로 다시 시도: `/g 5 YYYY-MM-DD HH:MM [제목]` (또는 종일이면 시간 생략). "
+            "큐는 유지됩니다."
+        )
+        return 0
+
+    event_id, cerr = _create_calendar_event(ev, item.get("msg_id", ""), item.get("note_path", ""))
+    if not event_id:
+        print(f"[브레인화 일정 실패] {cerr}\n큐는 유지됩니다.")
+        return 0
+
+    _attach_schedule_to_note(item, event_id, ev)
+    fl = item.setdefault("followups", [])
+    fl.append({
+        "kind": "schedule",
+        "summary": ev.get("summary", ""),
+        "start": ev.get("start", ""),
+        "event_id": event_id,
+        "at": now.isoformat(),
+    })
+
+    safety = _safety_bulk_label(plan)
+
+    ok, ferr = finalize_proceed(item, label=LABEL_DONE)
+    if not ok:
+        print(f"[브레인화 일정] 이벤트는 등록됐으나 라벨/archive 실패: {ferr}")
+        state["last_checked"] = now.isoformat()
+        save_state(state)
+        return 0
+
+    para = item.get("proposed_para_path") or "sources/00_inbox/"
+    residual = _count_pending_review(plan)
+    when_msg = ev["start"] if ev.get("all_day") else ev["start"]
+    header = (
+        safety
+        + f"[브레인화 일정] {_short_subject(item.get('subject',''), 40)}\n"
+        + f"  · Google Calendar 등록 — {ev.get('summary','')} @ {when_msg}"
+        + (f", 위치 {ev['location']}" if ev.get("location") else "")
+        + (" (종일)" if ev.get("all_day") else "")
+        + f" (event_id={event_id})\n"
         + f"  · 노트 위치 {para}, 라벨 '{LABEL_DONE}' + archive\n"
         + f"  · 잔여 review 대기 {residual}건\n\n"
     )
@@ -3408,6 +3656,8 @@ def main(argv: list[str]) -> int:
                                    create_gtask_too=True, user_due=user_due)
         if first == "gtask":
             return cmd_gtask(state, now, argv[1:])
+        if first == "schedule":
+            return cmd_schedule(state, now, argv[1:])
         if first == "nl":
             return cmd_nl(state, now, argv[1:])
         if first == "migrate-inbox":

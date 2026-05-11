@@ -86,14 +86,24 @@ def _clear_deferred() -> None:
 
 
 def _get_pending_review_item() -> dict | None:
-    """현재 검토 대기 중인 proceed 항목 (bot 이 마지막으로 propose 한 것).
-    /g 진행/보류/불필요 (id 없이) 가 자동으로 이 항목에 적용됨."""
+    """현재 propose 진행 중인 proceed 항목 (bot 이 노트 작성·메뉴 발화한 것).
+    /g 확정/답장/보류/불필요 (id 없이) 가 자동으로 이 항목에 적용됨.
+
+    판별: confirm_status='pending_review' + note_path 가 set.
+    note_path 는 propose_proceed() 가 실제 노트를 작성한 뒤에만 채워지므로,
+    "분류만 됐고 아직 propose 안 된 항목" 은 제외된다 (그렇지 않으면 /g 1 이
+    plan 발화 단계에서 approve 대신 곧장 confirm 으로 분기해 후속조치 메뉴를
+    건너뛰는 회귀가 발생)."""
     state = _load_state()
     if not state:
         return None
     plan = state.get("pending_plan") or {}
     for it in plan.get("items", []):
-        if it.get("category") == "proceed" and it.get("confirm_status") == "pending_review":
+        if (
+            it.get("category") == "proceed"
+            and it.get("confirm_status") == "pending_review"
+            and it.get("note_path")
+        ):
             return it
     return None
 
@@ -168,6 +178,11 @@ _HEX_ID = r"[0-9a-fA-F]{8,}"
 
 PATTERNS_FAST = [
     # ("action_type", regex)
+    # 숫자 단축키 — 컨텍스트 의존 (per-item review 중인지 plan 발화 단계인지).
+    # Per-item review 중 (propose'd item 존재): 1=저장 2=답장 3=답장할일 4=할일 5=일정 6=경로수정
+    # Plan 발화 단계 (review 항목 없음):       1=승인 2=재분류 3=취소
+    # /g 6 / /g 2 / /g 3 / /g 5 는 뒤에 자유 인자(경로·톤·메모·날짜) 가능.
+    ("numeric",         re.compile(r"^([1-6])(?:\s+(.+))?$")),
     # 컨텍스트 인식 긍정 — 검토 대기 있으면 confirm_current(즉시 종결), 없으면 approve.
     # "확정/ok/예/네/맞아/좋아/승인/approve/confirm" 모두 동일 의미.
     ("yes_context",     re.compile(r"^(?:확정|confirm|예|네|맞아|좋아|OK|승인|approve)\s*$", re.IGNORECASE)),
@@ -236,6 +251,11 @@ def tier1_parse(text: str) -> tuple[str, list[str]] | None:
         if action_type == "bulk_reclassify":
             raw = m.group(1).strip()
             return ("bulk_reclassify", raw.split())
+        if action_type == "numeric":
+            digit = m.group(1)
+            rest = (m.group(2) or "").strip()
+            args = [digit] + (rest.split() if rest else [])
+            return ("numeric", args)
         return (action_type, [])
     return None
 
@@ -344,7 +364,52 @@ def _no_pending_review_msg() -> int:
     return 1
 
 
+def _execute_numeric(args: list[str]) -> int:
+    """숫자 단축키 — context-aware.
+    Per-item review 중 (propose'd item 존재): 1=저장 2=답장 3=답장할일 4=할일 5=일정 6=경로수정
+    Plan 발화 단계 (review 항목 없음):       1=승인 2=재분류 3=취소
+    """
+    if not args:
+        return 1
+    digit = args[0]
+    rest = args[1:]
+    item = _get_pending_review_item()
+    if item:
+        tid = item["msg_id"]
+        if digit == "1":
+            return run_gws("confirm", tid)
+        if digit == "2":
+            return run_gws("reply", tid, *rest)
+        if digit == "3":
+            return run_gws("reply-task", tid, *rest)
+        if digit == "4":
+            return run_gws("gtask", tid, *rest)
+        if digit == "5":
+            return run_gws("schedule", tid, *rest)
+        if digit == "6":
+            if not rest:
+                print("[g] /g 6 (경로수정) 에는 경로가 필요합니다. 예: /g 6 02_areas/finance")
+                return 1
+            folder_arg = rest[0] if rest[0].startswith("folder=") else f"folder={rest[0]}"
+            extra = list(rest[1:])
+            return run_gws("edit", tid, folder_arg, *extra)
+        print(f"[g] 숫자 {digit} 은 per-item 메뉴에 없습니다. (1=저장 2=답장 3=답장할일 4=할일 5=일정 6=경로수정)")
+        return 1
+    # Plan-level
+    if digit == "1":
+        return run_gws("approve")
+    if digit == "2":
+        return run_gws("--force-poll")
+    if digit == "3":
+        return run_gws("cancel")
+    print(f"[g] 숫자 {digit} 은 plan 발화 단계에 없습니다. (1=승인 2=재분류 3=취소). "
+          "per-item 검토 단계라면 먼저 plan 을 승인해야 합니다.")
+    return 1
+
+
 def execute(action: str, args: list[str]) -> int:
+    if action == "numeric":
+        return _execute_numeric(args)
     if action == "yes_context":
         # 1) Tier 2 deferred action 우선 — 직전 confirmation 프롬프트의 의도 승계.
         deferred = _consume_deferred()
@@ -465,6 +530,21 @@ id 와 함께 (다른 메일 후처리 교정):
   /g 취소                          — plan 폐기
   /g 상태                          — 현재 plan/state (awaiting_reply 큐 포함)
   /g 다시 분류                     — 강제 폴링
+
+숫자 단축키 (한영전환 실패 대비, /ㅎ N 도 동일) — 컨텍스트 의존:
+
+  [Plan 발화 단계 — 검토 대기 항목 없음]
+    /g 1   = 승인 (= /g 맞아)
+    /g 2   = 재분류 (= /g 다시 분류)
+    /g 3   = 취소
+
+  [Per-item review — propose 메뉴 발화 중]
+    /g 1                       = 저장      (PARA 이동 + '브레인화/완료' + archive)
+    /g 2 [톤·요지]             = 답장      (Drafts 등록 + awaiting_reply 큐)
+    /g 3 [YYYY-MM-DD] [지시]   = 답장할일  (답장 + Google Tasks 등록)
+    /g 4 [YYYY-MM-DD] [메모]   = 할일      (Google Tasks 등록 + 즉시 종결)
+    /g 5 [YYYY-MM-DD HH:MM]    = 일정      (Google Calendar 등록 + 즉시 종결)
+    /g 6 <경로>                = 경로수정  (PARA 폴더 변경 + 즉시 종결)
   /g 보류 정리 [N]                 — '브레인화/보류' 라벨 메일 N건(기본 5) 라벨 제거 후 재분류 plan
   /g 재분류 진행1/불필요 보류2/진행 …  — plan 내 위치 기반 일괄 재분류 (Gmail 라벨은 안 건드림)
   /g 학습                          — 교정 로그 → deterministic 규칙 추출

@@ -63,7 +63,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - **`브레인화/보류`** — 외부 액션 대기 또는 분류 자신없음 (라벨, inbox 유지)
 - **`브레인화/불필요`** — 광고·자동알림·중복 등 (라벨 + archive)
 
-### 폴링 (cron, 평일 10분)
+### 폴링 (cron, 평일 30분)
 
 매 사이클:
 1. **awaiting_reply 큐 처리** — 게이트 무관, 항상 실행. 각 항목의 thread 에서 drafted_at 이후 SENT 라벨 메시지 검출 시 자동 promote (`브레인화/진행` → `브레인화/완료`) + 노트에 `replied_at` 기록 + 큐에서 제거.

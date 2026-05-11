@@ -15,7 +15,33 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 에 forward.
 | 사용자 메시지 | 실행 |
 |---|---|
 | `/g <한국어 텍스트>` | `python3 ~/.openclaw/workspace/skills/g/run.py <한국어 텍스트>` |
+| `/ㅎ <텍스트>` | **`/g` 와 동일** — 한영전환 실패 대비 alias. agent 는 `/ㅎ` 를 보면 `/g` 와 글자 단위 동일하게 취급해 같은 bash 한 줄 실행. |
 | `/g` (인자 없음) | 도움말 출력 |
+
+## 숫자 단축키 (한영전환 실패·빠른 응답) — 컨텍스트 의존
+
+같은 숫자가 컨텍스트에 따라 다른 동작에 매핑됩니다. `/ㅎ N` 도 동일.
+
+### Plan 발화 단계 (검토 대기 항목 없음)
+
+| 입력 | 의미 | 동등 명령 |
+|---|---|---|
+| `/g 1` | 승인 | `/g 맞아` (approve — noise/pending 일괄 처리 후 첫 proceed propose) |
+| `/g 2` | 재분류 | `/g 다시 분류` (강제 폴링) |
+| `/g 3` | 취소 | `/g 취소` (plan 폐기) |
+
+### Per-item review 단계 (propose 메뉴 발화 중 — note_path set)
+
+| 입력 | 의미 | 동등 명령 |
+|---|---|---|
+| `/g 1` | 저장 | `/g 확정` (PARA 이동 + `브레인화/완료` + archive) |
+| `/g 2 [톤·요지]` | 답장 | `/g 답장` (Drafts 등록 + `브레인화/진행` + awaiting_reply) |
+| `/g 3 [YYYY-MM-DD] [지시]` | 답장할일 | `/g 답장할일` (답장 + Google Tasks 등록) |
+| `/g 4 [YYYY-MM-DD] [메모]` | 할일 | `/g 할일` (Google Tasks 등록 + 즉시 종결) |
+| `/g 5 [YYYY-MM-DD HH:MM]` | 일정 | Google Calendar 등록 + 즉시 종결 |
+| `/g 6 <경로>` | 경로수정 | `/g 경로수정 folder=<경로>` (PARA 폴더 변경) |
+
+판별 방식: `g/run.py:_get_pending_review_item()` 가 `confirm_status="pending_review" AND note_path is set` 인 proceed 항목이 있는지로 컨텍스트를 결정. 노트 작성이 완료된(= propose 메뉴가 표시된) 항목이 있으면 per-item, 없으면 plan-level.
 
 ## 자연어 트리거 (슬래시 없는 발화)
 
