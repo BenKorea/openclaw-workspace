@@ -74,11 +74,11 @@ uv run playwright install chromium
 **호출 형식**:
 
 ```bash
-uv run --project ~/.openclaw/workspace/skills/webmail-watch run.py <tenant>
-uv run --project ~/.openclaw/workspace/skills/webmail-watch run.py <tenant> --bootstrap
+cd ~/.openclaw/workspace/skills/webmail-watch && uv run run.py <tenant>
+cd ~/.openclaw/workspace/skills/webmail-watch && uv run run.py <tenant> --bootstrap
 ```
 
-`--project` 로 venv 자동 해결. cwd 가 skill 디렉토리 안이면 `uv run run.py <tenant>` 로 단축 가능.
+> `uv run --project <path> run.py` 만으로는 동작 ✗ — `--project` 는 venv 위치만 지정, script path 는 cwd 기준 lookup. 절대경로로 부르려면 `uv run --project <path> <path>/run.py` 처럼 둘 다 적어야 함. cron wrapper 는 `cd ... && uv run run.py ...` 형태로 prepend 하여 동작.
 
 ## Browser 자동화 — Playwright + 전용 프로필
 
@@ -94,7 +94,7 @@ run.py 가 Playwright (Chromium bundled) 로 브라우저를 띄움. OpenClaw �
 새 tenant 등록 또는 webmail 의 "아이디저장" 쿠키 갱신 필요 시:
 
 ```bash
-uv run --project ~/.openclaw/workspace/skills/webmail-watch run.py kirams --bootstrap
+cd ~/.openclaw/workspace/skills/webmail-watch && uv run run.py kirams --bootstrap
 ```
 
 동작:
@@ -251,7 +251,7 @@ mcp tool 로 등록 (예: `webmail-watch-kirams` job):
 ```jsonc
 {
   "name": "webmail-watch-kirams",
-  "schedule": { "kind": "cron", "expr": "*/30 * * * *", "tz": "Asia/Seoul" },
+  "schedule": { "kind": "cron", "expr": "*/30 8-17 * * 1-5", "tz": "Asia/Seoul" },
   "sessionTarget": "isolated",
   "wakeMode": "now",
   "payload": { "kind": "agentTurn", "message": "/webmail-watch kirams" },

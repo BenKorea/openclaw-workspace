@@ -1,7 +1,7 @@
 ---
 name: society-watch
-description: 학회 자료실 polling — 새 게시글 자동 다운 → ~/projects/2nd-brain-vault/sources/00_inbox/ 드롭 + Telegram 알림. 1회 수동 로그인 + Chrome password manager 로 세션 영속.
-allowed_tools: [browser, bash]
+description: 학회 자료실 polling — 새 게시글 자동 다운 → ~/projects/2nd-brain-vault/sources/00_inbox/ 드롭 + Telegram 알림. toml 기반 자동 로그인 (webmail-watch 자매).
+allowed_tools: [bash]
 ---
 
 # society-watch
@@ -42,14 +42,13 @@ JSON 파일로 last-seen 추적:
 
 ## 절차
 
-### Step 1 — Listing snapshot
+### Step 1 — Listing fetch + 자동 로그인
 
-```
-browser open <listing URL>
-browser snapshot --format ai
-```
+`run.py` 가 Playwright headless context 로 `<listing URL>` 직진. 미인증 상태면 `/member/?url=...` 로그인 폼으로 redirect 됨 → `perform_login()` 가 toml 의 ID/PW 로 자동 fill + submit.
 
-세션 만료 감지 (URL 이 `/member/login.php` 류로 redirect 또는 페이지에 "아이디"·"비밀번호" textbox 존재) → Step 8 의 `session_expired` 알림 후 종료.
+자동 로그인 실패 시 `auth_failed` 알림 후 종료. 로그인은 성공했지만 listing 도달 실패 시 `listing_after_login_failed` 알림.
+
+OTP 가 추후 활성화되면 toml 에 `otp_secret` 추가 → `perform_login` 이 자동으로 OTP 단계 진행 (없으면 skip — webmail-watch 의 KIRAMS 와 동일 패턴).
 
 ### Step 2 — last_post_id 로드
 
@@ -72,31 +71,26 @@ listing snapshot 의 `<table>` row 들을 파싱.
 
 대상 0개면 → Step 7 의 last_checked 만 갱신 후 알림 없이 종료.
 
-### Step 4 — 각 새 글 detail snapshot
+### Step 4 — 각 새 글 detail fetch
 
 각 대상 글에 대해 (post_id 오름차순, 즉 가장 오래된 것부터):
 
 ```
-browser open https://www.ksnm.or.kr/bbs/index.html?code=<board>&number=<post_id>&mode=view
-browser snapshot --format ai
+page.goto(f"{KSNM_BASE}/bbs/index.html?code={board}&number={post_id}&mode=view")
 ```
 
-추출:
-- **제목**: row `"제 목 : <T>"` 에서 `<T>` 부분
-- **등록일**: row `"등록일 YYYY년 MM월 DD일 ..."` → `YYYY-MM-DD` 로 변환
-- **첨부파일들**: `rowheader "첨부파일N"` 의 cell 안 link 들. 각 link 의 (a) ref, (b) 표시 파일명 (img alt 또는 link text), (c) href 의 `number=` (download_id) 수집
+추출 (`_process_one_post`):
+- **제목**: `page.title()` 의 ":::: 대한핵의학회 ::::" 이후 부분 → `>` 로 split → 마지막 segment. fallback: 본문의 `제 목:` 패턴
+- **등록일**: 본문 텍스트의 `YYYY년 MM월 DD일` regex → `YYYY-MM-DD`
+- **첨부파일들**: `a[href*="filedown"], a[href*="download.php"], a[href*="file_down"], a[href*="bbs/download"]` 의 link 들. Playwright `expect_download` context 로 한 번에 하나씩 fetch.
+
+detail 페이지에서도 세션 만료 가능 — `#login_frm` 가 있으면 `session_expired` 으로 break.
 
 ### Step 5 — 콘텐츠 다운로드 + 파일명 정규화
 
 #### Case A — 첨부 1개 이상
 
-각 첨부 link 에 대해:
-
-```
-browser download <ref> /tmp/society-watch/<society>/<원파일명>
-```
-
-그 후 파일명 정규화 후 staging 으로 mv:
+각 첨부 link 에 대해 Playwright `expect_download` 으로 `/tmp/society-watch/<society>/<원파일명>` 에 저장 후 정규화 파일명으로 inbox 이동:
 
 ```
 YYYY-MM-DD_<society>_<title-slug>_<원파일베이스>.<ext>
@@ -137,14 +131,37 @@ detail snapshot 의 본문 영역 (제목 row 이후, "목록" 버튼 이전의 
 YYYY-MM-DD_<society>_<title-slug>.md
 ```
 
-### Step 6 — `sources/00_inbox/` 로 mv
+### Step 6 — PARA sources/ 로 mv + 동반 노트 생성
 
-```bash
-mkdir -p ~/projects/2nd-brain-vault/sources/00_inbox/
-mv /tmp/society-watch/<society>/<정규화 파일명> ~/projects/2nd-brain-vault/sources/00_inbox/
+#### 6-A: 첨부 있는 경우 (`para_path` 설정 시)
+
+**sources/ 경로**: `~/projects/2nd-brain-vault/sources/<para_path>/`  
+예: `sources/02_areas/대한핵의학회/보험관련/2026-05-07_ksnm-insur_<slug>_<원파일명>.pdf`
+
+mv 실패 → `io_failed` 알림, last_post_id 미갱신 (재시도 가능 상태 유지) 후 종료.
+
+**동반 노트**: `~/projects/2nd-brain-vault/knowledge/<para_path>/<date>_<society>_<slug>.md`
+
+vault CLAUDE.md §동반 노트 표준 frontmatter (2026-05-01+):
+```yaml
+---
+title: "..."
+source: 대한핵의학회 보험관련 보드 (...)
+date: YYYY-MM-DD
+tags: [ksnm, 보험관련, society-watch]
+sources:
+  - sources/02_areas/대한핵의학회/보험관련/<파일명>
+---
 ```
+본문: 각 첨부 파일 link + 메타데이터 + `## 요약` `## 내 생각` `## 관련 노트` stub.
 
-mv 실패 (디스크 가득, 권한 문제 등) → Step 8 의 `io_failed` 알림, last_post_id 미갱신 (재시도 가능 상태 유지) 후 종료.
+#### 6-B: 첨부 없는 경우
+
+본문 markdown 을 `knowledge/<para_path>/` 에 직접 저장 (노트 자체가 소스 역할).
+
+#### 6-C: `para_path` 미설정 보드 (legacy)
+
+기존처럼 `sources/00_inbox/` 에만 드롭. 동반 노트 미생성. 수동 브레인화.
 
 ### Step 7 — last_post_id + last_checked 갱신
 
@@ -163,11 +180,12 @@ mv "$TMP" ~/.openclaw/agents/main/memory/society-watch.json
 
 | 케이스 | 메시지 (단순한 한국어) |
 |---|---|
-| 새 자료 N≥1 | `📥 <학회표기> <보드표기> 새 자료 N개` 줄바꿈 후 각 제목 한 줄씩 (`- <제목>`), 마지막 줄 `→ sources/00_inbox/ 드롭됨. "인박스 브레인화해줘" 로 처리.` |
+| 새 자료 N≥1 (`para_path` 설정) | `📥 KSNM 보험관련 새 자료 N개 — 브레인화 완료` + 각 제목 + 노트 경로 힌트 |
+| 새 자료 N≥1 (legacy) | `📥 KSNM 보험관련 새 자료 N개` + 각 제목 + `→ "인박스 브레인화해줘" 로 처리` |
 | 새 자료 0개 | 알림 보내지 않음 (noise 회피) |
-| `session_expired` | `⚠ <학회표기> 세션 만료. WSLg 띄워서 'openclaw browser open https://www.ksnm.or.kr/member/' 후 재로그인 부탁합니다.` |
-| `partial_failure` (일부 첨부 다운로드 실패) | 성공분 정상 알림 + 끝에 `⚠ <K>개 첨부 다운로드 실패 — <원인 요약>` |
-| `io_failed` (sources/00_inbox 로 mv 실패) | `⚠ <학회표기> 자료 처리 실패: <원인 요약>. 다음 회차 재시도.` |
+| `session_expired` | `⚠ <학회표기> 세션 만료. WSLg 띄워서 'cd ~/.openclaw/workspace/skills/society-watch && uv run run.py <society> --bootstrap' 실행.` |
+| `partial_failure` (일부 첨부 다운로드 실패) | 성공분 정상 알림 + `⚠ K개 첨부 다운로드 실패 — 다음 회차 재시도.` |
+| `io_failed` (mv 실패) | `⚠ <학회표기> 자료 처리 실패: <원인>. 다음 회차 재시도.` |
 
 `<학회표기>` = "KSNM", `<보드표기>` = "보험관련" 식 — society registry 의 학회·보드 컬럼 사용.
 
@@ -198,15 +216,63 @@ mv "$TMP" ~/.openclaw/agents/main/memory/society-watch.json
 - `ksnm-add_bbs12`: 학술관련
 - 타 학회: `kthyroid-*`, `karp-*` 등 (별도 1회 수동 로그인 필요)
 
+## 자격증명 — 단일 toml 파일 (절대 모델 노출 ✗)
+
+webmail-watch 와 동일 정책 (옵션 C, 2026-05-11 도입). ID/PW (옵션 OTP) 모두 한 파일 (`chmod 600`) 에 통합. `run.py` 가 read-and-use, 어느 값도 stdout/log 로 흐르지 않음.
+
+### secret 파일 형식
+
+경로: `~/.openclaw/secrets/society-watch-<profile_key>.toml`. 같은 학회 내 다른 보드끼리 한 파일·한 profile 공유.
+
+```toml
+[KSNM]
+login_id = "<your KSNM ID>"
+login_pw = "<your password>"
+# OTP 가 활성화되면:
+# otp_secret = "<base32 secret>"
+# otp_digits = 6
+# otp_period = 30
+```
+
+- 섹션 키 (`[KSNM]`) 는 society 의 `profile_key` 또는 `key` 와 case-insensitive 매칭. 평탄 구조 fallback.
+- KeePassXC OTP export 와 호환.
+- Dr. Ben 이 직접 생성·관리. 모델은 path 만 알고 평문 미노출.
+
+## 의존성 — uv project mode
+
+webmail-watch 와 일관. 외부 python 의존성을 쓰는 skill 은 skill 디렉토리 안에 격리.
+
+- **의존성 SoT**: `pyproject.toml` (`playwright`, `pyotp`)
+- **venv 위치**: `<skill>/.venv/` (uv 가 자동 생성·관리)
+- **잠김**: `uv.lock` (재현성)
+
+**최초 설치**:
+
+```bash
+cd ~/.openclaw/workspace/skills/society-watch
+uv sync
+uv run playwright install chromium
+```
+
+**호출 형식**:
+
+```bash
+cd ~/.openclaw/workspace/skills/society-watch && uv run run.py <society>
+cd ~/.openclaw/workspace/skills/society-watch && uv run run.py <society> --bootstrap
+```
+
+> `uv run --project <path> run.py` 는 동작 ✗ — `--project` 는 venv 위치만 지정, script path 는 cwd 기준 lookup. 절대 경로로 부르려면 `uv run --project <path> <path>/run.py` 처럼 둘 다 적어야 함.
+
 ## 운영 메모
 
-- **자격증명**: SKILL 에 노출 ✗. Chrome password manager 안에만 보관 (1회 수동 로그인 시 저장됨). OpenClaw docs 의 *"Do not give the model your credentials"* 준수
 - **첫 호출**: 최근 5개만 받음 (인박스 폭주 회피). 운영 시작 후엔 delta 기반
-- **기본 cadence**: 하루 1회 07:00 KST. 세션 만료 빈도 측정 후 조정 (만료가 잦으면 cadence 더 자주 + 만료 처리 강화)
+- **기본 cadence**: 하루 1회 07:00 KST. 세션 만료 빈도 측정 후 조정 (만료가 잦으면 cadence 더 자주)
+- **세션 영속**: Playwright `launch_persistent_context` 로 chromium 프로필을 `~/.openclaw/skills/society-watch/chrome-profile/<profile_key>/` 에 보존. 쿠키·세션 cross-call 유지
 - **Single board per call**: 한 호출은 한 society 만 처리. 여러 보드는 cron 다중 등록으로 분리
 - **출력 destination**: 반드시 `~/projects/2nd-brain-vault/sources/00_inbox/`. 다른 위치 ✗ (brain-system 의 staging 규약. 후속 브레인화 워크플로우가 받지 못함)
 - **파일명 규칙**: brain-system [[CLAUDE.md]] §"파일명 규칙" 의 이벤트·캡처 형식 준수
-- **세션 만료 정상**: 영원히 자동 안 됨. 사람이 주기적으로 재로그인하는 게 정상 운영
+- **bootstrap**: `--bootstrap` 모드 — headed Chrome 으로 자동 로그인 시각 검증. WSLg 필요. 사람은 모니터링만, 창 닫으면 종료
+- **자동 재로그인**: toml 자격증명 기반 → 세션 만료해도 다음 cron 회차에서 자동 복구. 만료 알림은 secret 누락·selector 변경 같은 진짜 실패 시에만 발생
 
 ## 관련 문서
 

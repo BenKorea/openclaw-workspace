@@ -1,0 +1,9 @@
+[project]
+name = "society-watch"
+version = "0.1.0"
+description = "학회 자료실 polling — webmail-watch 자매. KSNM 보드 → 2nd-brain inbox + Telegram."
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.45",
+    "pyotp>=2.9",
+]
