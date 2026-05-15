@@ -34,6 +34,7 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | `/gws-assistant migrate-inbox [--apply]` | 기존 inbox 노트 일괄 PARA 정리 |
 | `/gws-assistant migrate-brainify-labels [--apply]` | 1회성 — legacy `브레인화/진행` 라벨 → `브레인화/완료` 일괄 promote |
 | `/gws-assistant pending-review [N]` | 보류 라벨 메일 N건 라벨 제거 후 재분류 plan |
+| `/gws-assistant save-drain [--dry-run] [N]` | §11 `1 저장` 라벨 완전무인 드레인 — 노트 생성+PARA 배치+`9 완료` commit. `--dry-run` 은 mutation 없이 계획만 |
 
 ## 출력 처리 규칙
 
@@ -62,6 +63,17 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - **`브레인화/진행`** — **임시** — 답장 발송 대기 (awaiting_reply 큐). 폴링이 SENT 메시지 감지 시 자동으로 `브레인화/완료` 로 promote.
 - **`브레인화/보류`** — 외부 액션 대기 또는 분류 자신없음 (라벨, inbox 유지)
 - **`브레인화/불필요`** — 광고·자동알림·중복 등 (라벨 + archive)
+
+### §11 8-라벨 액션 모델 — `1 저장` 완전무인 드레인
+
+위 3-라벨은 legacy(grandfathered). 신규 메일은 Dr. Ben 이 폰/PC 에서 8-라벨(`1 저장`~`8 회신`)로 직접 분류한다 (gmail-capture.md §11 권위). 본 스킬은 그 중 **`1 저장`만 완전무인 처리**:
+
+- 트리거: cron poll 매 사이클, awaiting_reply 처럼 게이트 무관 백그라운드. **킬스위치 `state['save_drain_enabled']` (기본 False)** — 검증 후 활성화. 수동: `save-drain [--dry-run]`.
+- 파이프라인 (크래시-안전): threadId 멱등 가드 → 본문 PHI gate → `propose_proceed`(노트 staging) → 첨부 `parse_attachment` (파서 레지스트리, 현재 internal) → frontmatter `para_review:pending`/`parser_id`/`parser_version` 주입 + 본문 `## 첨부 파싱` append → `_relocate_to_para`(첨부+노트 PARA 이동) → **commit point: `1 저장` 제거 + `9 완료` 부착 (strictly 마지막)**.
+- 멱등성: 라벨 변경이 commit point. 그 전 크래시 시 메일이 `1 저장` 잔류 → 다음 사이클이 threadId 가드로 [복구](라벨만)/[재개](staging 재배치+라벨) 분기.
+- PARA 추론 불확실 시 staging 잔류 + `para_review:pending` → 주간 §11.4 PARA 배치감사가 사후 교정 (낙관적 배치).
+- PHI 의심 시 노트 미작성 + `1 저장` 잔류 + 보고에 surface (수동 확인).
+- `2~8` 라벨 후속(회신/할일/일정)은 deferred — 동일 dispatch 패턴으로 확장 (§11.5).
 
 ### 폴링 (cron, 평일 30분)
 

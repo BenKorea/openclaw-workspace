@@ -104,6 +104,15 @@ LABEL_DONE = "브레인화/완료"      # 후속 작업까지 모두 종결. 영
 # Legacy 라벨 — 이미 부착된 메일은 그대로 두고 inbox 검색에서만 제외.
 LEGACY_LABEL_DUPLICATE = "브레인화/중복"
 
+# ── 8-라벨 액션 트리아지 모델 (gmail-capture.md §11, 2026-05-16) ──
+# Dr. Ben 이 폰/PC 에서 직접 부착하는 액션 라벨. 본 스킬은 그 중 `1 저장`만
+# 완전무인 처리한다 (§11.3). 2~8 은 deferred (§11.5).
+LABEL_SAVE = "1 저장"        # {} 행동 없음 — audit 동반 노트 + archive
+LABEL_DONE_9 = "9 완료"      # 터미널 표식 (기계 검증된 완료). legacy LABEL_DONE 와 무충돌.
+GMAIL_SAVE_MAX = 8           # 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
+# 파서 추상화 provenance (§11.3). provider 교체 시 _parser_* 가 자기 id/version 반환.
+PARSER_VERSION = "1"
+
 # LLM 분류는 3 카테고리로 출력:
 #   noise   → 라벨 LABEL_NOISE   + archive
 #   pending → 라벨 LABEL_PENDING (inbox 유지) — 외부 액션 대기 또는 분류 자신없음
@@ -3131,6 +3140,353 @@ def _poll_awaiting_replies(state: dict, now: dt.datetime) -> str:
     return "\n".join(lines)
 
 
+# ============================================================================
+# §11.3 `1 저장` 완전무인 파이프라인 (gmail-capture.md §11 권위)
+# ============================================================================
+#
+# 크래시-안전 순서: 노트 staging write → (첨부+노트) PARA 이동 → 라벨 변경(commit
+# point, strictly 마지막). 라벨 변경 전 어디서 죽어도 메일이 `1 저장` 잔류 →
+# 다음 사이클이 threadId 가드로 재진입해 멱등 복구.
+
+# ── 파서 추상화 (§11.3 호출부 범용화) ──
+# 파이프라인은 구체 파서가 아니라 parse_attachment() 단일 인터페이스만 호출.
+# 타입별 dispatch 레지스트리 — 현재 internal 만. 추후 Docling/MinerU 를
+# _register_parser("pdf", fn) 로 등록하면 파이프라인 코드 불변 (§11.6).
+PARSER_REGISTRY: dict[str, "callable"] = {}
+
+
+def _register_parser(ext: str, fn) -> None:
+    PARSER_REGISTRY[ext.lower().lstrip(".")] = fn
+
+
+def _parser_internal(path: pathlib.Path) -> dict:
+    """internal provider = Claude 내장 read (§11.3). 단일 파일을 마크다운으로 추출.
+    실패는 hard-fail 없이 warnings 로 degrade. 반환 계약은 parse_attachment 와 동일."""
+    base = {"text_markdown": "", "parser_id": "internal",
+            "parser_version": PARSER_VERSION, "warnings": []}
+    if not path.exists():
+        base["warnings"] = [f"파일 없음: {path.name}"]
+        return base
+    prompt = (
+        f"파일 경로: {path}\n"
+        "이 파일의 텍스트 내용을 깨끗한 마크다운으로 그대로 추출해 출력하라. "
+        "표는 마크다운 표로. 해설·요약·인사·꼬리말 절대 금지 — 추출 결과만."
+    )
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-haiku-4-5-20251001", "--allowedTools", "Read",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True,
+                            text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        base["warnings"] = ["internal parser timeout"]
+        return base
+    if r.returncode != 0:
+        base["warnings"] = [f"internal parser exit={r.returncode}"]
+        return base
+    txt = (r.stdout or "").strip()
+    base["text_markdown"] = txt[:12000]
+    if not txt:
+        base["warnings"] = ["빈 추출"]
+    return base
+
+
+def parse_attachment(path: pathlib.Path) -> dict:
+    """§11.3 단일 인터페이스. 타입별 dispatch → 등록 파서, 미등록 → internal.
+    반환: {text_markdown, parser_id, parser_version, warnings[]}."""
+    ext = path.suffix.lower().lstrip(".")
+    fn = PARSER_REGISTRY.get(ext, _parser_internal)
+    try:
+        out = fn(path)
+        # 계약 보장 — provider 가 키를 빠뜨려도 안전
+        out.setdefault("text_markdown", "")
+        out.setdefault("parser_id", "internal")
+        out.setdefault("parser_version", PARSER_VERSION)
+        out.setdefault("warnings", [])
+        return out
+    except Exception as e:  # noqa: BLE001 — 어떤 파서 예외도 파이프라인 죽이지 않음
+        return {"text_markdown": "", "parser_id": "internal",
+                "parser_version": PARSER_VERSION,
+                "warnings": [f"parse 예외 fallback: {type(e).__name__}: {e}"]}
+
+
+# ── threadId 멱등 가드 (§11.3 step 2) ──
+
+def _existing_note_for_thread(thread_id: str) -> tuple[pathlib.Path | None, bool]:
+    """knowledge/ + sources/00_inbox/ 에서 frontmatter gmail_threadIds 에
+    thread_id 가 든 노트 탐색. 반환 (note_path|None, relocated).
+    relocated=True 면 staging(00_inbox) 밖 = PARA 배치까지 끝난 상태."""
+    roots = [str(VAULT_ROOT / "knowledge"), str(VAULT_INBOX)]
+    try:
+        r = subprocess.run(
+            ["grep", "-rlF", "--include=*.md", thread_id, *roots],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return (None, False)
+    for line in (r.stdout or "").splitlines():
+        p = pathlib.Path(line.strip())
+        if not p.is_file():
+            continue
+        try:
+            fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        tids = fm.get("gmail_threadIds") or []
+        if isinstance(tids, list) and thread_id in tids:
+            relocated = (VAULT_INBOX not in p.parents) and (p.parent != VAULT_INBOX)
+            return (p, relocated)
+    return (None, False)
+
+
+# ── PHI backstop (§11.3) ──
+# 인간 게이트는 트리아지 시점(Dr. Ben 이 직접 `1 저장` 부착)으로 이동해
+# 구조적으로 해소됨. 아래는 값싼 backstop — 의심 시 노트 작성 보류 + 알림.
+_PHI_PATTERNS = [
+    re.compile(r"\b\d{6}[-\s]?\d{7}\b"),                 # 주민등록번호
+    re.compile(r"환자.{0,8}(등록번호|차트번호|병록번호)"),
+    re.compile(r"\b(MRN|chart\s*no)\b", re.IGNORECASE),
+]
+
+
+def _phi_suspect(text: str) -> bool:
+    return any(p.search(text or "") for p in _PHI_PATTERNS)
+
+
+def _ensure_label_9() -> None:
+    """`9 완료` 라벨 best-effort 생성 (이미 있으면 gog 가 에러 — 무시).
+    실제 부착 실패는 commit 단계에서 per-item 으로 surface 된다."""
+    gog_call("gmail", "labels", "create", LABEL_DONE_9)
+
+
+def _commit_save_label(thread_id: str) -> tuple[bool, str]:
+    """§11.3 step 7 commit point — strictly 마지막. `1 저장` 제거 + `9 완료` 부착
+    + inbox 제거 (이미 archived 면 무해).
+    주의: gog `--remove` 는 콤마구분 단일 플래그 — 반복 금지 (반복 시 1개만 적용)."""
+    return gog_call(
+        "gmail", "labels", "modify", thread_id,
+        "--add", LABEL_DONE_9, "--remove", f"{LABEL_SAVE},INBOX",
+    )
+
+
+def _save_inject_provenance(note_rel: str, parser_id: str,
+                            parser_version: str, warnings: list[str]) -> None:
+    """staging 노트 frontmatter 에 para_review/parser provenance 주입 (atomic)."""
+    p = VAULT_ROOT / note_rel
+    if not p.exists():
+        return
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    text = _replace_fm_field(text, "para_review", "pending")
+    text = _replace_fm_field(text, "parser_id", parser_id)
+    text = _replace_fm_field(text, "parser_version", parser_version)
+    if warnings:
+        text = _replace_fm_field(
+            text, "parse_warnings",
+            "[" + ", ".join(w.replace(",", " ") for w in warnings) + "]")
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(p.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
+
+
+def _save_append_parsed(note_rel: str, parsed: list[tuple[str, dict]]) -> None:
+    """추출된 첨부 마크다운을 staging 노트 본문에 `## 첨부 파싱` 섹션으로 append."""
+    if not parsed:
+        return
+    p = VAULT_ROOT / note_rel
+    if not p.exists():
+        return
+    blocks = ["\n\n## 첨부 파싱 (parser: internal v" + PARSER_VERSION + ")\n"]
+    for name, out in parsed:
+        md = (out.get("text_markdown") or "").strip()
+        warns = out.get("warnings") or []
+        blocks.append(f"\n### {name}\n")
+        if md:
+            blocks.append("\n" + md.replace("```", "`​``") + "\n")
+        else:
+            blocks.append(f"\n(추출 실패 — {', '.join(warns) or '내용 없음'})\n")
+    try:
+        text = p.read_text(encoding="utf-8") + "".join(blocks)
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(p.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
+
+
+def _run_save_drain(state: dict, now: dt.datetime, *,
+                    dry_run: bool = False,
+                    limit: int = GMAIL_SAVE_MAX) -> str:
+    """`1 저장` 큐를 완전무인 드레인 (§11.3). Telegram 보고 문자열 반환 (없으면 "").
+    dry_run=True 면 mutation 없이 계획만 (검증용)."""
+    # `-label:"9 완료"` 를 일부러 빼서 자가치유: commit 이 부분 실패해 두 라벨이
+    # 다 붙은 stuck 항목도 재선택되어 threadId 가드 → 복구 commit 으로 교정된다.
+    # 정상 처리분은 `1 저장` 이 제거되므로 어차피 재선택 안 됨 (무한 재처리 없음).
+    query = f'label:"{LABEL_SAVE}"'
+    results = gog_json("gmail", "search", query, "--max", str(limit))
+    if results is None:
+        return "[1 저장 드레인] gmail 검색 실패 (gog OAuth?)\n"
+    if isinstance(results, dict):
+        results = results.get("messages", results.get("items", []))
+    if not results:
+        return ""
+
+    done: list[str] = []
+    repaired: list[str] = []
+    held_phi: list[str] = []
+    errors: list[str] = []
+    planned: list[str] = []
+
+    if not dry_run:
+        _ensure_label_9()
+
+    for m in results:
+        tid = m.get("id")
+        subj = (m.get("subject") or "").strip() or "(제목 없음)"
+        short = _short_subject(subj, 50)
+        if not tid:
+            continue
+
+        # ── step 2: threadId 멱등 가드 ──
+        existing, relocated = _existing_note_for_thread(tid)
+        if existing is not None and relocated:
+            # 노트+이동 끝, 라벨만 미완 → commit 복구
+            if dry_run:
+                planned.append(f"· {short} → [복구] 라벨 commit 만")
+                continue
+            ok, err = _commit_save_label(tid)
+            (repaired if ok else errors).append(
+                short if ok else f"{short} (라벨 복구 실패: {err})")
+            continue
+
+        item: dict = {"msg_id": tid, "from": m.get("from", ""),
+                      "subject": subj}
+
+        if existing is not None and not relocated:
+            # 노트는 staging 에 있음 (이동 전 크래시) → 재배치 + commit
+            if dry_run:
+                planned.append(f"· {short} → [재개] staging 노트 재배치+commit")
+                continue
+            try:
+                fm = _parse_frontmatter(existing.read_text(encoding="utf-8"))
+            except OSError:
+                fm = {}
+            item["note_path"] = str(existing.relative_to(VAULT_ROOT))
+            item["attachments"] = fm.get("sources") or []
+            para = _normalize_para_coord(fm.get("proposed_para_path") or "")
+            if para:
+                ok, err = _relocate_to_para(item, para)
+                if not ok:
+                    errors.append(f"{short} (재배치 실패: {err})")
+                    continue
+            ok, err = _commit_save_label(tid)
+            (done if ok else errors).append(
+                short if ok else f"{short} (commit 실패: {err})")
+            continue
+
+        # ── 신규: 본문 PHI gate (노트 쓰기 전) ──
+        pre = fetch_thread_full(tid)
+        if pre is None:
+            errors.append(f"{short} (thread fetch 실패)")
+            continue
+        pmsg = _pick_target_message(pre, tid)
+        body_probe = ""
+        if pmsg:
+            body_probe = _extract_plain_text(pmsg.get("payload") or {}) \
+                or pmsg.get("snippet", "")
+        if _phi_suspect(body_probe + " " + subj):
+            held_phi.append(short)
+            continue  # 라벨 그대로 — `1 저장` 잔류, 다음 사이클 재평가
+
+        if dry_run:
+            planned.append(f"· {short} → [신규] 노트 생성+배치+commit")
+            continue
+
+        # ── step 3~6: 본문 fetch + 노트 생성 + staging write ──
+        ok, err = propose_proceed(item)
+        if not ok:
+            errors.append(f"{short} ({err})")
+            continue
+        note_rel = item.get("note_path")
+
+        # 첨부 파서 dispatch → provenance + 본문 append (§11.3)
+        parsed: list[tuple[str, dict]] = []
+        all_warns: list[str] = []
+        for arel in item.get("attachments") or []:
+            ap = VAULT_ROOT / arel
+            out = parse_attachment(ap)
+            parsed.append((_strip_gog_prefix(ap.name), out))
+            all_warns.extend(out.get("warnings") or [])
+        if note_rel:
+            _save_append_parsed(note_rel, parsed)
+            _save_inject_provenance(note_rel, "internal",
+                                    PARSER_VERSION, all_warns)
+
+        # ── step 5: PARA 이동 (첨부+노트, frontmatter sources 갱신) ──
+        para = _normalize_para_coord(item.get("proposed_para_path") or "")
+        if para:
+            ok, err = _relocate_to_para(item, para)
+            if not ok:
+                errors.append(f"{short} (PARA 이동 실패: {err})")
+                continue
+        # para 비면 staging 잔류 — para_review:pending + 주간 §11.4 감사가 배치
+
+        # ── step 7: commit point (strictly 마지막) ──
+        ok, err = _commit_save_label(tid)
+        (done if ok else errors).append(
+            short if ok else f"{short} (commit 실패: {err})")
+
+    if dry_run:
+        if not planned:
+            return "[1 저장 드레인 — dry-run] 처리 대상 없음\n"
+        return ("[1 저장 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
+                + "\n".join(planned) + "\n")
+
+    if not (done or repaired or held_phi or errors):
+        return ""
+    lines = ["[1 저장 → 9 완료] 자동 처리"]
+    if done:
+        lines.append(f"  ✓ 완료 {len(done)}건: " + ", ".join(done))
+    if repaired:
+        lines.append(f"  ↻ 라벨 복구 {len(repaired)}건: " + ", ".join(repaired))
+    if held_phi:
+        lines.append(f"  ⚠ PHI 의심 보류 {len(held_phi)}건 (수동 확인): "
+                     + ", ".join(held_phi))
+    if errors:
+        lines.append(f"  ✗ 실패 {len(errors)}건: " + "; ".join(errors))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def cmd_save_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """`/gws-assistant save-drain [--dry-run] [N]` — `1 저장` 수동 드레인.
+    cron 자동발화와 동일 로직, 검증·수동 트리거용."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    msg = _run_save_drain(state, now, dry_run=dry, limit=lim)
+    if msg:
+        print(msg, end="" if msg.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
 def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     """1. awaiting_reply 큐 발송 감지 → LABEL_PROCEED → LABEL_DONE 자동 promote (게이트 무관).
        2. Gates → 통과해야 신규 메일 발화.
@@ -3138,6 +3494,13 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
        4. fetch inbox pending → classify → merge into pending plan.
        5. plan 의 msg_id set 가 마지막 발화 set 와 다르면 발화."""
     awaiting_msg = _poll_awaiting_replies(state, now)
+
+    # §11.3 `1 저장` 완전무인 드레인 — awaiting_reply 처럼 게이트 무관 (백그라운드).
+    # 킬스위치: state['save_drain_enabled'] (기본 False). 검증 후 Dr. Ben 이 활성화.
+    if state.get("save_drain_enabled"):
+        _sd = _run_save_drain(state, now)
+        if _sd:
+            awaiting_msg = (_sd + awaiting_msg) if awaiting_msg else _sd
 
     if not force:
         gate_fail = check_gates(now)
@@ -3676,6 +4039,8 @@ def main(argv: list[str]) -> int:
             return cmd_pending_review(state, now, batch_size=bs)
         if first == "bulk-reclassify":
             return cmd_bulk_reclassify(state, now, argv[1:])
+        if first == "save-drain":
+            return cmd_save_drain(state, now, argv[1:])
         if first == "--force-poll" or first == "--force-batch":
             return cmd_poll(state, now, force=True)
         # unknown — fall through to poll
