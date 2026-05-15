@@ -213,6 +213,23 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
   - **Depends on**: P8.1
   - **Done when**: 1주 통계 수집, cadence·재시도 정책 조정 필요 여부 판단
 
+- [x] **P8.3 데스크탑(kimbi) 첫 운영 + timing race fix** *(2026-05-15 완료)*
+  - **트리거**: 노트북(ai4lt) P8.1 (2026-05-10) 통과 후 데스크탑(kimbi) 첫 cron 시도. 5회 cron + 3회 수동 trigger 모두 fail. 4단계 진단으로 원인 분리.
+  - **진단 흐름 (4단계, 각각 별개 원인)**:
+    1. **Chromium 시스템 deps 미설치** — `process_failed: Playwright Chromium libnspr4.so 등 ENOENT`. fix: `sudo /home/ben/.local/bin/uv run playwright install-deps chromium`. 부수 발견 — **sudo PATH sanitization trap**: `~/.local/bin` 이 sudo 의 secure_path 에 없어 `sudo uv ...` 가 `command not found`. uv 절대경로 또는 `sudo env "PATH=$PATH" uv ...` 필요.
+    2. **secret 파일 미배치** — `FileNotFoundError: ~/.openclaw/secrets/webmail-watch-kirams.toml`. 노트북 secret 을 nano paste 로 데스크탑에 배치 (chmod 600). 검증: pyotp 로 생성한 TOTP 코드가 폰 인증기와 일치 (`scripts/totp-check.py` 류).
+    3. **`auth_failed` × 4회** — ID 입력 단계 fail. 진단: PW length·invisible char·시계 drift·동시 접속 모두 reject. 원인: KIRAMS **"아이디저장" cookie 가 chrome-profile/kirams 에 없음** (노트북엔 누적, 데스크탑은 첫 진입). run.py 는 PW 만 fill 하고 ID 는 cookie prefill 가정. fix: `--bootstrap` headed 1회 + Dr. Ben 직접 "아이디저장" 체크 → cookie 정착. 객관 검증: Cookies sqlite 에 `rememberid` cookie 정착 확인.
+    4. **`1건 forwarding 실패` × 3회** — `forward_via_webmail` 단계 fail (메일이 listing 에 still 남아있음으로 분리). selector stale 가설 의심됐으나 **reject** — Dr. Ben 의 수동 forward 정상 작동. demo 모드 (headed + `slow_mo=800ms`) 에서 3건 모두 OK → **timing race 확정**. 빠른 환경(데스크탑 RTX 3060) 이 chip 변환·reactive UI 보다 빠르게 다음 action 발생 → race. 느린 환경(노트북 Intel Arc CPU, GPU qwen 점유) 은 자연 slow_mo 효과로 미발현. [[user-machines-spec]] 비대칭이 운영 신뢰성에 영향 준 첫 사례.
+  - **fix**: `run.py` 의 `open_context` 에 `slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "300"))` 추가. default 300ms — race 안전망 + poll_limit=3 회차당 5~10초 추가 (무해). env 로 0 override 가능 (디버깅·노트북 OFF).
+  - **demo 자료 영속화**: `scripts/demo.py + demo.sh` — headed + slow_mo + Playwright tracing + 사람 wait. 시각 검증·교육·향후 selector 변경 자동 탐지 자산. trace 사후 review: `npx playwright show-trace /tmp/webmail-trace.zip`.
+  - **데스크탑 신규 셋업 체크리스트** (PC 추가 시):
+    1. `sudo /home/ben/.local/bin/uv run playwright install-deps chromium`
+    2. `~/.openclaw/secrets/webmail-watch-kirams.toml` 배치 (chmod 600)
+    3. `bash scripts/demo.sh` 1회 (또는 `uv run run.py kirams --bootstrap`) — KIRAMS "아이디저장" 체크 + 받은편지함 도달 → cookie 정착
+  - **부수 발견 — `log.exception` 의 traceback 미캡처**: `PYTHONUNBUFFERED=1` 으로도 stack 누락. uv run subprocess wrapper 의 stderr buffer 또는 logging-Playwright 의 미상 race. 진단 흐름에선 *대안 분리* (시간선 분석 + Dr. Ben 수동 검증 + demo 모드) 로 우회. Phase 9 후보: log.exception 출력 보장 (file handler 추가 또는 sys.excepthook 명시).
+  - **부수 발견 — `report()` 의 partial failure 메시지 불분리**: `"K건 forwarding 실패"` 가 *forward* 와 *move* 양쪽 fail 을 같은 메시지로 보고. Phase 9 후보: outcome.failures 의 `error` prefix (`forward:` / `move:`) 를 메시지에 반영.
+  - **부수 발견 — `bootstrap_run` print 메시지 부정확**: "ID/PW + OTP 를 자동 주입" 이라고 표시하지만 실제로 perform_login 은 PW 만 fill (ID 는 cookie prefill 가정). Phase 9 후보: print 메시지 정정 + bootstrap UX 개선 (ID 자동 입력 옵션 추가 등).
+
 ---
 
 ## §Checklist — 운영 사이클 검증

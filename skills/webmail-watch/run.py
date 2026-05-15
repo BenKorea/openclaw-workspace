@@ -164,6 +164,10 @@ def open_context(pw: Playwright, tenant: TenantConfig, headless: bool) -> Browse
         # 옵션 C 채택 후 Chrome PM 의존 제거 → Playwright bundled Chromium 사용 (channel 미지정).
         # WSL headless 환경 안정성 보강.
         headless=headless,
+        # 빠른 환경(예: kimbi RTX 3060)에서 KIRAMS chip 변환/reactive UI 의 timing race 발현 —
+        # action 사이 slow_mo 안전망. env 로 0 override 가능 (디버깅·노트북 OFF).
+        # 2026-05-15 데스크탑 첫 운영 시 발견 (PROGRESS P8.3).
+        slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "300")),
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
         args=["--no-sandbox", "--disable-dev-shm-usage"],
