@@ -1108,10 +1108,37 @@ def _attachment_dir(thread_id: str) -> pathlib.Path:
     return VAULT_ATTACH_ROOT / thread_id
 
 
-def propose_proceed(item: dict) -> tuple[bool, str]:
+def _pick_target_in_thread(thread_payload: dict, label: str) -> dict | None:
+    """라벨-인지 대상 메시지 선택 (2026-05-16 wrong-message 버그 수정).
+    gog 검색은 thread 단위(메시지 id 없음) → 스레드 안에서 트리거 라벨이
+    실제 붙은 메시지를 골라야 함. `_pick_target_message` 의 silent msgs[0]
+    fallback 이 '엉뚱한(첫) 메시지로 노트 생성' 의 근원이었음.
+    - 단일 메시지 스레드: 모호성 없음 → 그 메시지 (라벨 표현 무관·안전).
+    - 멀티: labelIds 에 label 든 메시지(복수면 최신 internalDate).
+      label='SENT' 는 시스템 라벨(신뢰) = 최신 보낸 메시지(=내 회신).
+    - 못 찾으면 **None** (호출자가 skip+report — silent 오귀속 금지).
+    주의: 사용자 라벨이 labelIds 에 *이름* 으로 오는 전제(gog 는 이름 기반;
+    thread-level `labels` 도 이름). id 라면 멀티는 None→안전 skip(오염 X)."""
+    thread = thread_payload.get("thread") or {}
+    msgs = thread.get("messages") or []
+    if not msgs:
+        return None
+    if len(msgs) == 1:
+        return msgs[0]
+    cands = [m for m in msgs if label in (m.get("labelIds") or [])]
+    if not cands:
+        return None
+    cands.sort(key=lambda m: int(m.get("internalDate", "0") or "0"))
+    return cands[-1]
+
+
+def propose_proceed(item: dict, *,
+                    target_label: str | None = None) -> tuple[bool, str]:
     """Brainify Phase 1 — 본문 fetch + 동반 노트 작성 + atomic write. **라벨/archive 안 함.**
     item을 in-place로 채움: note_path / proposed_para_path / proposed_links / body_summary /
     attachments / confirm_status='pending_review'.
+    target_label: 주어지면 스레드에서 그 라벨(또는 'SENT') 붙은 메시지를
+      라벨-인지 선택 (multi-msg 스레드 정확). None 이면 legacy 동작 유지.
     Returns (ok, error_or_empty)."""
     thread_id = item.get("msg_id")
     if not thread_id:
@@ -1122,7 +1149,13 @@ def propose_proceed(item: dict) -> tuple[bool, str]:
     if payload is None:
         return (False, "thread fetch 실패")
 
-    msg = _pick_target_message(payload, thread_id)
+    if target_label is not None:
+        msg = _pick_target_in_thread(payload, target_label)
+        if msg is None:
+            return (False,
+                    f"스레드에서 '{target_label}' 대상 메시지 식별 실패 — skip")
+    else:
+        msg = _pick_target_message(payload, thread_id)
     if not msg:
         return (False, "thread 에 메시지 없음")
 
@@ -3428,7 +3461,9 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
             continue
 
         # ── 본문 fetch + 노트 생성 + staging write ──
-        ok, err = propose_proceed(item)
+        # target_label=label: gog 검색이 thread 단위라, 스레드 안에서 이
+        # 라벨이 실제 붙은 메시지를 선택 (multi-msg wrong-message 버그 수정).
+        ok, err = propose_proceed(item, target_label=label)
         if not ok:
             errors.append(f"{short} ({err})")
             continue
@@ -3580,11 +3615,10 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
     planned: list[str] = []
 
     for m in results:
-        tid = m.get("threadId") or m.get("id")    # canonical thread key (가드)
-        reply_id = m.get("id")                    # 회신 메시지 (노트 콘텐츠)
+        tid = m.get("id")    # gog 검색은 thread 단위 — id == threadId
         subj = (m.get("subject") or "").strip() or "(제목 없음)"
         short = _short_subject(subj, 50)
-        if not tid or not reply_id:
+        if not tid:
             continue
 
         # 멱등: 이 스레드 노트 이미 있으면 skip (라벨 없는 모델의 done 마커)
@@ -3592,17 +3626,17 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
         if existing is not None:
             continue
 
-        # 2026-05-16 Dr. Ben: 회신+콜드 전부 — cold mail 제외 체크 + 그 전용
-        # pre-fetch 제거. fetch 실패는 propose_proceed 가 자체 surface.
+        # 2026-05-16 Dr. Ben: 회신+콜드 전부 (cold 제외 없음).
         if dry_run:
             planned.append(f"· {short} → [보낸메일 브레인화]")
             continue
 
-        # 노트: 보낸 메시지로 빌드 (회신이면 본문에 원문 인용 포함 →
-        # build_companion_note_llm 이 교신 전체 요약 가능; 콜드면 보낸 내용).
-        item: dict = {"msg_id": reply_id, "from": m.get("from", ""),
+        # 노트: 스레드의 *최신 SENT 메시지*(= 내가 보낸 회신/메일)로 빌드.
+        # target_label="SENT" 가 multi-msg 스레드에서 정확한 메시지 선택
+        # (이전 버그: msgs[0]=원본 inbound 로 잘못 생성됐었음).
+        item: dict = {"msg_id": tid, "from": m.get("from", ""),
                       "subject": subj}
-        ok, err = propose_proceed(item)
+        ok, err = propose_proceed(item, target_label="SENT")
         if not ok:
             errors.append(f"{short} ({err})")
             continue
