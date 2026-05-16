@@ -3540,19 +3540,25 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
     시작한 콜드메일이든 audit 가치 있으면 노트화(가치 판단은 노트 LLM 단계).
     - 라벨 없는 모델: 제거할 라벨도 `9 완료` 부착도 없음(그건 1~8 액션 터미널).
       멱등성 = **스레드 노트 존재**(threadId 가드)뿐.
-    - KIRAMS 포워딩 노이즈(To:self → INBOX+SENT 둘 다)는 **`-in:inbox`**
-      구조적 구분자로 제외. `[KIRAMS-FWD]` 제목표는 보조(prefix 없는
-      `[FW]` 변종도 있어 제목 필터만으론 불충분 — 2026-05-16 dry-run 발견).
+    - KIRAMS 포워딩 노이즈 배제 = `[KIRAMS-FWD]` 제목(항상 노이즈) +
+      `-(from:kirams.re.kr subject:"[FW]")`(prefix 없는 변종). archive 후엔
+      라벨모양이 진짜 보낸 메일과 같아 `-in:inbox` 불가; Dr. Ben 이 KIRAMS
+      별칭 send-as 진짜 메일도 보내므로 from:kirams 전체 배제도 불가 →
+      from:kirams **AND [FW]** 조합 정밀 배제(별칭의 진짜 Re:/신규 보존).
     - 노트는 *보낸 메시지*(회신이면 원문 인용 포함)로 빌드해 교신 캡처. 단
       frontmatter gmail_threadIds 는 canonical threadId 로 덮어써 가드 멱등 일치.
     v1 한계: 노트 있는 스레드의 *추가* 메일 미포착 (thread 진화 append 는
     gmail-capture §9.2 로 위임). 라벨핸들러와의 교차 중복은 드물고 주간 §9.2
     감사가 포착. 반환 (full, problem) — 성공 침묵·오류만."""
-    # `-in:inbox`: KIRAMS 포워딩은 To:자기자신 → INBOX+SENT 둘 다 보유.
-    # 진짜 보낸 메일(회신·콜드)은 상대에게 보내 inbox 에 없음. 이게
-    # `[KIRAMS-FWD]`/`[FW]` 제목 유무·발신 별칭과 무관한 구조적 구분자.
-    # (미세 false-neg: 나→나 자기메모 메일 — 드물고 `1 저장` 이 더 적합.)
-    query = (f'in:sent -in:inbox -subject:"[KIRAMS-FWD]" '
+    # KIRAMS 포워딩 노이즈 정밀 배제 (2026-05-16 2차 dry-run 으로 확정):
+    #  - 이미 archive 돼 `-in:inbox` 로는 진짜 보낸 메일과 구분 불가.
+    #  - Dr. Ben 은 KIRAMS 별칭 send-as 로 진짜 회신/메일도 Gmail 에서
+    #    보냄 → from:kirams 전체 배제 불가(정당분까지 막힘).
+    #  - 정밀 구분: ① `[KIRAMS-FWD]` 제목 = 항상 노이즈(webmail-watch)
+    #    ② from:kirams **AND** `[FW]` = prefix 없는 포워딩 변종.
+    #  KIRAMS 별칭의 진짜 `Re:`/신규 메일은 [FW] 아니라 보존됨.
+    query = (f'in:sent -subject:"[KIRAMS-FWD]" '
+             f'-(from:kirams.re.kr subject:"[FW]") '
              f'-label:"{LABEL_DONE_9}" newer_than:{REPLY_SENT_WINDOW_DAYS}d')
     results = gog_json("gmail", "search", query, "--max", str(limit))
     if results is None:
