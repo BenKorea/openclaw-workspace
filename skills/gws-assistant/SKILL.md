@@ -75,6 +75,35 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - PHI 의심 시 노트 미작성 + `1 저장` 잔류 + 보고에 surface (수동 확인).
 - `2~8` 라벨 후속(회신/할일/일정)은 deferred — 동일 dispatch 패턴으로 확장 (§11.5).
 
+### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
+
+본 skill 은 **[구 3-라벨 AI분류 모델] → [§11 8-라벨 인간트리아지 모델]** 이행 중. 전환기엔 양 표면 공존(보존하며 이행). 어느 코드가 transitional 인지·언제 삭제하는지 명시해 mini-sdd 합법화 — open-ended 레거시 보존(폐기 트리거 없음)이 안티패턴.
+
+**표면 분류**
+
+| 구분 | 범위 | 운명 |
+|---|---|---|
+| **TARGET** | `save-drain`·§11.5 `2~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·PHI backstop·`_commit_save_label`·`LABEL_SAVE`/`LABEL_DONE_9` | 영구 |
+| **SHARED-INFRA** | `propose_proceed`·`_relocate_to_para`·`gog_call/json`·노트/frontmatter/PARA 헬퍼·`fetch_thread_full`·Tasks/Calendar 헬퍼·state | 영구 (레거시 삭제 후 TARGET 전용 잔존) |
+| **LEGACY** (게이트서 일괄 삭제) | 3-라벨 classify→plan→approve 흐름 전체: `cmd_poll` 발화경로·`classify_emails_llm`·`build_plan_items`·`merge_plan`·`approve/confirm/edit/skip/dismiss/cancel`·`reply/reply-task/gtask/schedule/nl`·`correct/reclassify/bulk-reclassify/learn-rules/show-rules`·`awaiting_reply` 큐·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE` 상수·해당 SKILL.md 행 | 게이트 충족 시 |
+| **ONE-SHOT** | `migrate-inbox`·`migrate-brainify-labels` | 1회 사용 후 즉시 삭제 (게이트 무관) |
+
+> 2026-05-16 Dr. Ben 확정: AI분류 튜닝군(`correct`/`learn-rules` 등)은 8-라벨선 인간이 분류하므로 전부 LEGACY. gates/`snooze` 도 LEGACY — 자동드레인은 게이트 무관이라 레거시 제거 시 소비자 0.
+
+**폐기 게이트 트리거 (AND — 전부 충족 시에만 LEGACY 삭제)**
+
+1. `save_drain_enabled=true` 로 `1 저장` 자동드레인 prod **무사고 ≥ 4주** (또는 무사고 사이클 ≥ 20)
+2. §11.5 `2~8` 핸들러 출시·검증 완료 (회신/할일/일정을 신 모델이 커버 — 선행 안 하면 capability 손실)
+3. Dr. Ben 실제 트리아지가 8-라벨 스와이프로 완전 이행 (구 "AI분류+Telegram approve" 가 더 이상 작업흐름 아님 — 운영 확인)
+4. 신 모델 SKILL.md manual test commands 전부 통과 (회귀 안전망)
+5. (구조 선행조건) `run.py` 관심사별 분해되어 LEGACY 가 **단일 모듈로 격리** → 삭제 = 모듈+dispatch 제거
+
+**삭제 절차 (게이트 충족 후, 독자 mini-sdd 단위)**
+
+- spec: "LEGACY 모듈+dispatch+`LABEL_*` 상수+SKILL.md 레거시 행 제거, 동작보존(TARGET 무영향)"
+- acceptance: 신 모델 manual test 전부 통과 + 레거시 명령은 명시적 deprecation stub 반환
+- 핸드오프: `/cron off → 삭제 → 단위테스트 → /git-routine sync → /cron on → smoke test` (openclaw-skill-dev.md 워크플로우)
+
 ### 폴링 (cron, 평일 30분)
 
 매 사이클:
