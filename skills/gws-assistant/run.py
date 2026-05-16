@@ -3330,20 +3330,24 @@ def _save_append_parsed(note_rel: str, parsed: list[tuple[str, dict]]) -> None:
 
 def _run_save_drain(state: dict, now: dt.datetime, *,
                     dry_run: bool = False,
-                    limit: int = GMAIL_SAVE_MAX) -> str:
-    """`1 저장` 큐를 완전무인 드레인 (§11.3). Telegram 보고 문자열 반환 (없으면 "").
-    dry_run=True 면 mutation 없이 계획만 (검증용)."""
+                    limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`1 저장` 큐를 완전무인 드레인 (§11.3). 반환 (full, problem):
+    - full    = 전체 요약 (수동 터미널용 — 성공 포함 전부)
+    - problem = 오류/PHI-보류만 (cron→Telegram 용). 정상 성공만이면 ""
+    Telegram 정책 (2026-05-16 Dr. Ben): 성공은 완전 침묵, 이상 시에만 알림.
+    dry_run=True 면 mutation 없이 계획만 (problem 항상 "")."""
     # `-label:"9 완료"` 를 일부러 빼서 자가치유: commit 이 부분 실패해 두 라벨이
     # 다 붙은 stuck 항목도 재선택되어 threadId 가드 → 복구 commit 으로 교정된다.
     # 정상 처리분은 `1 저장` 이 제거되므로 어차피 재선택 안 됨 (무한 재처리 없음).
     query = f'label:"{LABEL_SAVE}"'
     results = gog_json("gmail", "search", query, "--max", str(limit))
     if results is None:
-        return "[1 저장 드레인] gmail 검색 실패 (gog OAuth?)\n"
+        _m = "[1 저장 드레인] gmail 검색 실패 (gog OAuth?)\n"
+        return (_m, _m)
     if isinstance(results, dict):
         results = results.get("messages", results.get("items", []))
     if not results:
-        return ""
+        return ("", "")
 
     done: list[str] = []
     repaired: list[str] = []
@@ -3452,12 +3456,12 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
 
     if dry_run:
         if not planned:
-            return "[1 저장 드레인 — dry-run] 처리 대상 없음\n"
+            return ("[1 저장 드레인 — dry-run] 처리 대상 없음\n", "")
         return ("[1 저장 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
-                + "\n".join(planned) + "\n")
+                + "\n".join(planned) + "\n", "")
 
     if not (done or repaired or held_phi or errors):
-        return ""
+        return ("", "")
     lines = ["[1 저장 → 9 완료] 자동 처리"]
     if done:
         lines.append(f"  ✓ 완료 {len(done)}건: " + ", ".join(done))
@@ -3469,7 +3473,16 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
     if errors:
         lines.append(f"  ✗ 실패 {len(errors)}건: " + "; ".join(errors))
     lines.append("")
-    return "\n".join(lines)
+    full = "\n".join(lines)
+    # problem = 오류/PHI-보류만 (성공 done/repaired 는 Telegram 침묵)
+    prob: list[str] = []
+    if held_phi:
+        prob.append(f"[1 저장] ⚠ PHI 의심 보류 {len(held_phi)}건 (수동 확인): "
+                    + ", ".join(held_phi))
+    if errors:
+        prob.append(f"[1 저장] ✗ 실패 {len(errors)}건: " + "; ".join(errors))
+    problem = ("\n".join(prob) + "\n") if prob else ""
+    return (full, problem)
 
 
 def cmd_save_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
@@ -3480,9 +3493,9 @@ def cmd_save_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
     for a in argv:
         if a.isdigit():
             lim = max(1, int(a))
-    msg = _run_save_drain(state, now, dry_run=dry, limit=lim)
-    if msg:
-        print(msg, end="" if msg.endswith("\n") else "\n")
+    full, _problem = _run_save_drain(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
     save_state(state)
     return 0
 
@@ -3495,12 +3508,14 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
        5. plan 의 msg_id set 가 마지막 발화 set 와 다르면 발화."""
     awaiting_msg = _poll_awaiting_replies(state, now)
 
-    # §11.3 `1 저장` 완전무인 드레인 — awaiting_reply 처럼 게이트 무관 (백그라운드).
-    # 킬스위치: state['save_drain_enabled'] (기본 False). 검증 후 Dr. Ben 이 활성화.
+    # §11.3 `1 저장` 완전무인 드레인 — 게이트 무관 (백그라운드).
+    # Telegram 정책 (2026-05-16): 성공은 완전 침묵, 오류/PHI-보류만 발화.
+    # 일일 다이제스트 폐기 — 1~8 잔존은 곧 처리될 in-flight 라 무의미.
+    # 킬스위치: state['save_drain_enabled'] (기본 False).
     if state.get("save_drain_enabled"):
-        _sd = _run_save_drain(state, now)
-        if _sd:
-            awaiting_msg = (_sd + awaiting_msg) if awaiting_msg else _sd
+        _full, _problem = _run_save_drain(state, now)
+        if _problem:
+            awaiting_msg = (_problem + awaiting_msg) if awaiting_msg else _problem
 
     if not force:
         gate_fail = check_gates(now)
