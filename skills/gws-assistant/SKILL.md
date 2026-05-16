@@ -68,7 +68,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 위 3-라벨은 legacy(grandfathered). 신규 메일은 Dr. Ben 이 폰/PC 에서 8-라벨(`1 저장`~`8 회신`)로 직접 분류한다 (gmail-capture.md §11 권위). 본 스킬은 그 중 **`1 저장`만 완전무인 처리**:
 
-- 트리거: cron poll 매 사이클, 게이트 무관 백그라운드. **킬스위치 `state['save_drain_enabled']` (기본 False)** — 검증 후 활성화. 수동: `save-drain [--dry-run]`.
+- 트리거: cron poll 매 사이클, 게이트 무관 백그라운드. **단일 킬스위치 `state['autodrain_enabled']` (기본 False)** 가 1~8 핸들러 전부 관장 (2026-05-16 Dr. Ben: 라벨별 플래그 아님 — 인지부하 최소·현실 부합). 검증 후 활성화. 수동 서브커맨드(`save-drain [--dry-run]` 등)는 킬스위치 무관 항상 동작.
 - **Telegram 정책 (2026-05-16 Dr. Ben)**: 성공(완료/복구)은 **완전 침묵**. **오류 발생 시에만** 1건 발화. 일일 다이제스트 폐기 — 1~8 잔존은 (2~8 핸들러 완성 후엔) 곧 처리될 in-flight 라 보고가 무의미. `_run_save_drain` 은 `(full, problem)` 반환: 수동 `save-drain` 은 full 전체 출력(터미널), cron 은 problem 만 Telegram.
 - 파이프라인 (크래시-안전): threadId 멱등 가드 → `propose_proceed`(노트 staging) → 첨부 `parse_attachment` (파서 레지스트리, 현재 internal) → frontmatter `para_review:pending`/`parser_id`/`parser_version` 주입 + 본문 `## 첨부 파싱` append → `_relocate_to_para`(첨부+노트 PARA 이동) → **commit point: `1 저장` 제거 + `9 완료` 부착 (strictly 마지막)**.
 - 멱등성: 라벨 변경이 commit point. 그 전 크래시 시 메일이 `1 저장` 잔류 → 다음 사이클이 threadId 가드로 [복구](라벨만)/[재개](staging 재배치+라벨) 분기.
@@ -93,7 +93,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 **폐기 게이트 트리거 (AND — 전부 충족 시에만 LEGACY 삭제)**
 
-1. `save_drain_enabled=true` 로 `1 저장` 자동드레인 prod **무사고 ≥ 4주** (또는 무사고 사이클 ≥ 20)
+1. `autodrain_enabled=true` 로 자동드레인(활성 핸들러 전체) prod **무사고 ≥ 4주** (또는 무사고 사이클 ≥ 20) — 단일 플래그라 1~8 통합 검증 시계 1개
 2. §11.5 `2~8` 핸들러 출시·검증 완료 (회신/할일/일정을 신 모델이 커버 — 선행 안 하면 capability 손실)
 3. Dr. Ben 실제 트리아지가 8-라벨 스와이프로 완전 이행 (구 "AI분류+Telegram approve" 가 더 이상 작업흐름 아님 — 운영 확인)
 4. 신 모델 SKILL.md manual test commands 전부 통과 (회귀 안전망)

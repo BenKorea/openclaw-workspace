@@ -3479,14 +3479,21 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
        5. plan 의 msg_id set 가 마지막 발화 set 와 다르면 발화."""
     awaiting_msg = _poll_awaiting_replies(state, now)
 
-    # §11.3 `1 저장` 완전무인 드레인 — 게이트 무관 (백그라운드).
-    # Telegram 정책 (2026-05-16): 성공은 완전 침묵, 오류 시에만 발화.
-    # 일일 다이제스트 폐기 — 1~8 잔존은 곧 처리될 in-flight 라 무의미.
-    # 킬스위치: state['save_drain_enabled'] (기본 False).
-    if state.get("save_drain_enabled"):
-        _full, _problem = _run_save_drain(state, now)
-        if _problem:
-            awaiting_msg = (_problem + awaiting_msg) if awaiting_msg else _problem
+    # §11 액션-라벨 완전무인 드레인 — 게이트 무관 (백그라운드).
+    # 단일 킬스위치 state['autodrain_enabled'] (기본 False) 가 1~8 핸들러
+    # 전부를 관장 (2026-05-16 Dr. Ben: 라벨별 플래그 대신 단일 — 인지부하 최소·현실 부합).
+    # Telegram: 성공 완전 침묵, 오류 시에만 발화 (일일 다이제스트 없음).
+    # 핸들러 계약: (state, now) -> (full, problem). 2~8 은 §11.5 에서
+    # 아래 튜플에 append (동일 게이트·동일 problem 누적).
+    if state.get("autodrain_enabled"):
+        _problems: list[str] = []
+        for _handler in (_run_save_drain,):   # 1 저장. 추후 2~8 핸들러 추가.
+            _full, _problem = _handler(state, now)
+            if _problem:
+                _problems.append(_problem)
+        if _problems:
+            _pm = "".join(_problems)
+            awaiting_msg = (_pm + awaiting_msg) if awaiting_msg else _pm
 
     if not force:
         gate_fail = check_gates(now)
