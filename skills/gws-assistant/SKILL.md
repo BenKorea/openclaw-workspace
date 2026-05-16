@@ -36,6 +36,7 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | `/gws-assistant pending-review [N]` | 보류 라벨 메일 N건 라벨 제거 후 재분류 plan |
 | `/gws-assistant save-drain [--dry-run] [N]` | §11 `1 저장` 라벨 완전무인 드레인 — 노트 생성+PARA 배치+`9 완료` commit. `--dry-run` 은 mutation 없이 계획만 |
 | `/gws-assistant schedule-drain [--dry-run] [N]` | §11.5 `2 일정` 라벨 완전무인 드레인 — 노트 + **Google Calendar 이벤트** + PARA 배치 + `9 완료`. `--dry-run` 은 계획만 |
+| `/gws-assistant reply-drain [--dry-run] [N]` | §11.5 **회신 브레인화** — 라벨 0마찰. 보낸편지함 폴링 → 진짜 회신(스레드에 inbound 있음, `[KIRAMS-FWD]` 제외) 교신을 노트화. `--dry-run` 은 계획만 |
 
 ## 출력 처리 규칙
 
@@ -76,7 +77,9 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - PARA 추론 불확실 시 staging 잔류 + `para_review:pending` → 주간 §11.4 PARA 배치감사가 사후 교정 (낙관적 배치).
 - PHI 점검 없음 (2026-05-16): 이 Gmail 계정엔 환자정보 송수신 자체가 없어 미수행. CLAUDE.md 2026-04-24 결정과 일관 — 재도입 금지.
 - 코어 `_run_label_drain` 이 1~8 공용 (label/tag/extra_action 파라미터). `_run_save_drain`(1 저장, extra=없음)·`_run_schedule_drain`(2 일정, extra=Calendar 이벤트)·`_schedule_extra_action`(idempotent — calendar_event_id 있으면 재생성 skip, 크래시-재개 안전).
-- **`2 일정` 출시 (2026-05-16)**: audit 노트 + Calendar 이벤트(`_extract_schedule_from_email`→`_create_calendar_event`→`_attach_schedule_to_note`) + `9 완료`. 일시 추출 실패 시 commit 안 함 + 오류 발화(수동 처리). `3~8`(회신/할일/복합)은 deferred — `extra_action` 추가만으로 확장 (§11.5).
+- **`2 일정` 출시 (2026-05-16)**: audit 노트 + Calendar 이벤트(`_extract_schedule_from_email`→`_create_calendar_event`→`_attach_schedule_to_note`) + `9 완료`. 일시 추출 실패 시 commit 안 함 + 오류 발화(수동 처리).
+- **회신 브레인화 출시 (2026-05-16, `_run_reply_drain`)**: Dr. Ben 결정 — 회신 시 라벨 안 누름(0마찰). 그래서 `8 회신` 라벨 경로가 아니라 **보낸편지함 폴링** 으로 포착하는 별도 함수. `in:sent -subject:"[KIRAMS-FWD]" -label:"9 완료" newer_than:2d` → 스레드에 inbound 있는 진짜 회신만(cold mail 제외). 노트는 회신 메시지(원문 인용 포함)로 빌드, frontmatter `gmail_threadIds` 를 canonical threadId 로 덮어써 가드 멱등. **라벨 없는 모델**: 제거할 라벨·`9 완료` 부착 없음, 멱등성=노트존재뿐. v1 한계: 노트 있는 스레드의 추가 회신 미포착(§9.2 thread 진화로 위임), 라벨핸들러 교차중복 드묾(주간 §9.2 감사 포착). `brainify_origin: gmail-reply` 마커.
+- `3~8` **라벨** 핸들러는 deferred — `extra_action` 추가만으로 확장. 단 회신 기능은 위 무라벨 경로가 커버하므로 `8 회신` 라벨 경로는 사실상 우선순위 낮음(Dr. Ben 회신 시 라벨 안 함).
 
 ### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
 
@@ -86,7 +89,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 | 구분 | 범위 | 운명 |
 |---|---|---|
-| **TARGET** | `_run_label_drain` 코어·`save-drain`/`schedule-drain`·§11.5 `3~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_action_label`·`LABEL_SAVE`/`LABEL_SCHEDULE`/`LABEL_DONE_9` | 영구 |
+| **TARGET** | `_run_label_drain` 코어·`save-drain`/`schedule-drain`/`reply-drain`·`_run_reply_drain`·§11.5 `3~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_action_label`·`LABEL_SAVE`/`LABEL_SCHEDULE`/`LABEL_DONE_9` | 영구 |
 | **SHARED-INFRA** | `propose_proceed`·`_relocate_to_para`·`gog_call/json`·노트/frontmatter/PARA 헬퍼·`fetch_thread_full`·Tasks/Calendar 헬퍼·state | 영구 (레거시 삭제 후 TARGET 전용 잔존) |
 | **LEGACY** (게이트서 일괄 삭제) | 3-라벨 classify→plan→approve 흐름 전체: `cmd_poll` 발화경로·`classify_emails_llm`·`build_plan_items`·`merge_plan`·`approve/confirm/edit/skip/dismiss/cancel`·`reply/reply-task/gtask/schedule/nl`·`correct/reclassify/bulk-reclassify/learn-rules/show-rules`·`awaiting_reply` 큐·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE` 상수·해당 SKILL.md 행 | 게이트 충족 시 |
 | **ONE-SHOT** | `migrate-inbox`·`migrate-brainify-labels` | 1회 사용 후 즉시 삭제 (게이트 무관) |
