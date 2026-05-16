@@ -3360,6 +3360,9 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
     if isinstance(results, dict):
         results = results.get("messages", results.get("items", []))
     if not results:
+        # 수동 dry-run 은 0건도 명시 (cron 비-dry 는 침묵 유지)
+        if dry_run:
+            return (f"[{tag} 드레인 — dry-run] 처리 대상 없음 (검색 0건)\n", "")
         return ("", "")
 
     done: list[str] = []
@@ -3567,6 +3570,9 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
     if isinstance(results, dict):
         results = results.get("messages", results.get("items", []))
     if not results:
+        # 수동 dry-run 은 0건도 명시 (cron 비-dry 는 침묵 유지)
+        if dry_run:
+            return ("[보낸메일 드레인 — dry-run] 처리 대상 없음 (검색 0건)\n", "")
         return ("", "")
 
     done: list[str] = []
