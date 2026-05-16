@@ -109,6 +109,7 @@ LEGACY_LABEL_DUPLICATE = "브레인화/중복"
 # 완전무인 처리한다 (§11.3). 2~8 은 deferred (§11.5).
 LABEL_SAVE = "1 저장"        # {} 행동 없음 — audit 동반 노트 + archive
 LABEL_DONE_9 = "9 완료"      # 터미널 표식 (기계 검증된 완료). legacy LABEL_DONE 와 무충돌.
+LABEL_SCHEDULE = "2 일정"    # {일정} — audit 노트 + Google Calendar 이벤트 (§11.5)
 GMAIL_SAVE_MAX = 8           # 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
 # 파서 추상화 provenance (§11.3). provider 교체 시 _parser_* 가 자기 id/version 반환.
 PARSER_VERSION = "1"
@@ -3251,13 +3252,13 @@ def _ensure_label_9() -> None:
     gog_call("gmail", "labels", "create", LABEL_DONE_9)
 
 
-def _commit_save_label(thread_id: str) -> tuple[bool, str]:
-    """§11.3 step 7 commit point — strictly 마지막. `1 저장` 제거 + `9 완료` 부착
-    + inbox 제거 (이미 archived 면 무해).
+def _commit_action_label(thread_id: str, src_label: str) -> tuple[bool, str]:
+    """§11 commit point — strictly 마지막. src_label 제거 + `9 완료` 부착
+    + inbox 제거 (이미 archived 면 무해). 1~8 공용 (src_label 만 다름).
     주의: gog `--remove` 는 콤마구분 단일 플래그 — 반복 금지 (반복 시 1개만 적용)."""
     return gog_call(
         "gmail", "labels", "modify", thread_id,
-        "--add", LABEL_DONE_9, "--remove", f"{LABEL_SAVE},INBOX",
+        "--add", LABEL_DONE_9, "--remove", f"{src_label},INBOX",
     )
 
 
@@ -3319,21 +3320,25 @@ def _save_append_parsed(note_rel: str, parsed: list[tuple[str, dict]]) -> None:
             pass
 
 
-def _run_save_drain(state: dict, now: dt.datetime, *,
-                    dry_run: bool = False,
-                    limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
-    """`1 저장` 큐를 완전무인 드레인 (§11.3). 반환 (full, problem):
-    - full    = 전체 요약 (수동 터미널용 — 성공 포함 전부)
-    - problem = 오류만 (cron→Telegram 용). 정상 성공만이면 ""
-    Telegram 정책 (2026-05-16 Dr. Ben): 성공은 완전 침묵, 이상 시에만 알림.
-    dry_run=True 면 mutation 없이 계획만 (problem 항상 "")."""
-    # `-label:"9 완료"` 를 일부러 빼서 자가치유: commit 이 부분 실패해 두 라벨이
-    # 다 붙은 stuck 항목도 재선택되어 threadId 가드 → 복구 commit 으로 교정된다.
-    # 정상 처리분은 `1 저장` 이 제거되므로 어차피 재선택 안 됨 (무한 재처리 없음).
-    query = f'label:"{LABEL_SAVE}"'
+def _run_label_drain(state: dict, now: dt.datetime, *,
+                     label: str, tag: str,
+                     extra_action=None,
+                     dry_run: bool = False,
+                     limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """§11 액션-라벨 완전무인 드레인 코어 (1~8 공용).
+    label   : 트리거·제거 라벨 (예 '1 저장', '2 일정')
+    tag     : 보고 머리표
+    extra_action: 신규·재개 경로에서 노트 staging 직후·PARA 이동 전에 실행할
+                  콜백 (item, now)->(ok, err). None 이면 없음.
+                  **idempotent 필수** — 크래시 후 재개 시 재호출되므로
+                  (예: 이미 만든 캘린더 이벤트 재생성 금지).
+    반환 (full, problem): full=전체요약(터미널), problem=오류만(cron→Telegram).
+    `-label:"9 완료"` 미포함 — commit 부분실패 stuck 도 가드로 자가치유.
+    Telegram 정책: 성공 침묵, 오류만. dry_run=계획만 (problem 항상 "")."""
+    query = f'label:"{label}"'
     results = gog_json("gmail", "search", query, "--max", str(limit))
     if results is None:
-        _m = "[1 저장 드레인] gmail 검색 실패 (gog OAuth?)\n"
+        _m = f"[{tag} 드레인] gmail 검색 실패 (gog OAuth?)\n"
         return (_m, _m)
     if isinstance(results, dict):
         results = results.get("messages", results.get("items", []))
@@ -3355,14 +3360,14 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
         if not tid:
             continue
 
-        # ── step 2: threadId 멱등 가드 ──
+        # ── threadId 멱등 가드 ──
         existing, relocated = _existing_note_for_thread(tid)
         if existing is not None and relocated:
-            # 노트+이동 끝, 라벨만 미완 → commit 복구
+            # 노트+이동 끝 (extra_action 도 끝남), 라벨만 미완 → commit 복구
             if dry_run:
                 planned.append(f"· {short} → [복구] 라벨 commit 만")
                 continue
-            ok, err = _commit_save_label(tid)
+            ok, err = _commit_action_label(tid, label)
             (repaired if ok else errors).append(
                 short if ok else f"{short} (라벨 복구 실패: {err})")
             continue
@@ -3371,7 +3376,7 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
                       "subject": subj}
 
         if existing is not None and not relocated:
-            # 노트는 staging 에 있음 (이동 전 크래시) → 재배치 + commit
+            # staging 노트 존재 (이동 전 크래시) → extra_action 보강 + 재배치 + commit
             if dry_run:
                 planned.append(f"· {short} → [재개] staging 노트 재배치+commit")
                 continue
@@ -3381,23 +3386,28 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
                 fm = {}
             item["note_path"] = str(existing.relative_to(VAULT_ROOT))
             item["attachments"] = fm.get("sources") or []
+            if extra_action is not None:
+                ok, err = extra_action(item, now)   # idempotent
+                if not ok:
+                    errors.append(f"{short} ({err})")
+                    continue
             para = _normalize_para_coord(fm.get("proposed_para_path") or "")
             if para:
                 ok, err = _relocate_to_para(item, para)
                 if not ok:
                     errors.append(f"{short} (재배치 실패: {err})")
                     continue
-            ok, err = _commit_save_label(tid)
+            ok, err = _commit_action_label(tid, label)
             (done if ok else errors).append(
                 short if ok else f"{short} (commit 실패: {err})")
             continue
 
-        # ── 신규 (PHI 점검 없음 — 위 주석 참조) ──
+        # ── 신규 (PHI 점검 없음) ──
         if dry_run:
             planned.append(f"· {short} → [신규] 노트 생성+배치+commit")
             continue
 
-        # ── step 3~6: 본문 fetch + 노트 생성 + staging write ──
+        # ── 본문 fetch + 노트 생성 + staging write ──
         ok, err = propose_proceed(item)
         if not ok:
             errors.append(f"{short} ({err})")
@@ -3417,7 +3427,14 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
             _save_inject_provenance(note_rel, "internal",
                                     PARSER_VERSION, all_warns)
 
-        # ── step 5: PARA 이동 (첨부+노트, frontmatter sources 갱신) ──
+        # 라벨별 추가 액션 (예: 2 일정 = Calendar 이벤트). idempotent.
+        if extra_action is not None:
+            ok, err = extra_action(item, now)
+            if not ok:
+                errors.append(f"{short} ({err})")
+                continue
+
+        # PARA 이동 (첨부+노트, frontmatter sources 갱신)
         para = _normalize_para_coord(item.get("proposed_para_path") or "")
         if para:
             ok, err = _relocate_to_para(item, para)
@@ -3426,20 +3443,20 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
                 continue
         # para 비면 staging 잔류 — para_review:pending + 주간 §11.4 감사가 배치
 
-        # ── step 7: commit point (strictly 마지막) ──
-        ok, err = _commit_save_label(tid)
+        # commit point (strictly 마지막)
+        ok, err = _commit_action_label(tid, label)
         (done if ok else errors).append(
             short if ok else f"{short} (commit 실패: {err})")
 
     if dry_run:
         if not planned:
-            return ("[1 저장 드레인 — dry-run] 처리 대상 없음\n", "")
-        return ("[1 저장 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
+            return (f"[{tag} 드레인 — dry-run] 처리 대상 없음\n", "")
+        return (f"[{tag} 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
                 + "\n".join(planned) + "\n", "")
 
     if not (done or repaired or errors):
         return ("", "")
-    lines = ["[1 저장 → 9 완료] 자동 처리"]
+    lines = [f"[{tag} → 9 완료] 자동 처리"]
     if done:
         lines.append(f"  ✓ 완료 {len(done)}건: " + ", ".join(done))
     if repaired:
@@ -3451,9 +3468,51 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
     # problem = 오류만 (성공 done/repaired 는 Telegram 침묵)
     prob: list[str] = []
     if errors:
-        prob.append(f"[1 저장] ✗ 실패 {len(errors)}건: " + "; ".join(errors))
+        prob.append(f"[{tag}] ✗ 실패 {len(errors)}건: " + "; ".join(errors))
     problem = ("\n".join(prob) + "\n") if prob else ""
     return (full, problem)
+
+
+def _run_save_drain(state: dict, now: dt.datetime, *,
+                    dry_run: bool = False,
+                    limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`1 저장` (={}) — audit 동반 노트만, 추가 액션 없음 (§11.3)."""
+    return _run_label_drain(state, now, label=LABEL_SAVE, tag="1 저장",
+                            extra_action=None, dry_run=dry_run, limit=limit)
+
+
+def _schedule_extra_action(item: dict, now: dt.datetime) -> tuple[bool, str]:
+    """`2 일정` 추가 액션 — 노트에서 일시 추출 → Google Calendar 이벤트 생성.
+    **idempotent**: 노트 frontmatter 에 calendar_event_id 가 이미 있으면
+    재생성 안 함 (크래시 후 재개 시 중복 이벤트 방지)."""
+    note_rel = item.get("note_path")
+    if note_rel:
+        p = VAULT_ROOT / note_rel
+        if p.exists():
+            try:
+                fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
+                if fm.get("calendar_event_id"):
+                    return (True, "")          # 이미 생성됨 (재개 경로)
+            except OSError:
+                pass
+    ev = _extract_schedule_from_email(item, now)
+    if ev is None:
+        return (False, "일정 추출 실패 — 메일에 명확한 일시 없음 (수동 처리 필요)")
+    event_id, cerr = _create_calendar_event(
+        ev, item.get("msg_id", ""), item.get("note_path", ""))
+    if not event_id:
+        return (False, f"Calendar 생성 실패: {cerr}")
+    _attach_schedule_to_note(item, event_id, ev)
+    return (True, "")
+
+
+def _run_schedule_drain(state: dict, now: dt.datetime, *,
+                        dry_run: bool = False,
+                        limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`2 일정` (={일정}) — audit 노트 + Google Calendar 이벤트 + 9 완료 (§11.5)."""
+    return _run_label_drain(state, now, label=LABEL_SCHEDULE, tag="2 일정",
+                            extra_action=_schedule_extra_action,
+                            dry_run=dry_run, limit=limit)
 
 
 def cmd_save_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
@@ -3465,6 +3524,21 @@ def cmd_save_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
         if a.isdigit():
             lim = max(1, int(a))
     full, _problem = _run_save_drain(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
+def cmd_schedule_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """`/gws-assistant schedule-drain [--dry-run] [N]` — `2 일정` 수동 드레인.
+    cron 자동발화와 동일 로직 (Calendar 이벤트 + 노트 + 9 완료), 검증·수동용."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    full, _problem = _run_schedule_drain(state, now, dry_run=dry, limit=lim)
     if full:
         print(full, end="" if full.endswith("\n") else "\n")
     save_state(state)
@@ -3487,7 +3561,7 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     # 아래 튜플에 append (동일 게이트·동일 problem 누적).
     if state.get("autodrain_enabled"):
         _problems: list[str] = []
-        for _handler in (_run_save_drain,):   # 1 저장. 추후 2~8 핸들러 추가.
+        for _handler in (_run_save_drain, _run_schedule_drain):  # 1 저장·2 일정. 추후 3~8.
             _full, _problem = _handler(state, now)
             if _problem:
                 _problems.append(_problem)
@@ -4034,6 +4108,8 @@ def main(argv: list[str]) -> int:
             return cmd_bulk_reclassify(state, now, argv[1:])
         if first == "save-drain":
             return cmd_save_drain(state, now, argv[1:])
+        if first == "schedule-drain":
+            return cmd_schedule_drain(state, now, argv[1:])
         if first == "--force-poll" or first == "--force-batch":
             return cmd_poll(state, now, force=True)
         # unknown — fall through to poll
