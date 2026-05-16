@@ -2524,6 +2524,11 @@ def _attach_schedule_to_note(item: dict, event_id: str, ev: dict) -> None:
         return
     text = _replace_fm_field(text, "calendar_event_id", event_id)
     text = _replace_fm_field(text, "calendar_start", ev.get("start", ""))
+    # 사람 기준 포함 종료일 (Google 배타적 end 가 아님 — audit 추적용)
+    text = _replace_fm_field(text, "calendar_end",
+                             ev.get("end", ev.get("start", "")))
+    text = _replace_fm_field(text, "calendar_all_day",
+                             "true" if ev.get("all_day") else "false")
     try:
         fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(note_path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2537,16 +2542,27 @@ def _attach_schedule_to_note(item: dict, event_id: str, ev: dict) -> None:
 
 
 def _create_calendar_event(ev: dict, thread_id: str, note_rel: str) -> tuple[str | None, str]:
-    """Google Calendar primary 에 이벤트 생성. Returns (event_id, error)."""
+    """Google Calendar primary 에 이벤트 생성. Returns (event_id, error).
+    주의: all-day 이벤트의 end.date 는 Google API 에서 **EXCLUSIVE(배타적)** —
+    사람 기준 포함 종료일을 그대로 넘기면 하루 짧게 표시됨(예 9.8~9.12 →
+    9.8~9.11). all_day 면 종료일 +1 (단일일 포함). 시간 있는 이벤트는 무관."""
     description = (
         f"Gmail thread: https://mail.google.com/mail/u/0/#inbox/{thread_id}\n"
         f"Vault note: {note_rel}"
     )
+    start = ev["start"]
+    end = ev.get("end") or start
+    if ev.get("all_day"):
+        try:
+            end = (dt.date.fromisoformat(end[:10])
+                   + dt.timedelta(days=1)).isoformat()
+        except (ValueError, TypeError):
+            pass  # 파싱 실패 → 원본 유지 (best-effort)
     args = [
         "calendar", "create", "primary",
         "--summary", ev.get("summary") or "(제목 없음)",
-        "--from", ev["start"],
-        "--to", ev.get("end") or ev["start"],
+        "--from", start,
+        "--to", end,
         "--description", description,
     ]
     if ev.get("location"):
