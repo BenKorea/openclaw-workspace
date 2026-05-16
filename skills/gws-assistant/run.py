@@ -3535,22 +3535,22 @@ def _run_schedule_drain(state: dict, now: dt.datetime, *,
 def _run_reply_drain(state: dict, now: dt.datetime, *,
                      dry_run: bool = False,
                      limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
-    """보낸편지함의 '진짜 회신' 을 브레인화 (§11.5, 라벨 0마찰 경로).
-    Dr. Ben 이 라벨 없이 직접 보낸 회신을 SENT 폴링으로 포착.
+    """보낸편지함 전체(회신+콜드)를 브레인화 (§11.5, 라벨 0마찰 경로).
+    2026-05-16 Dr. Ben: 방향 무관 — 내가 보낸 메일은 회신이든 내가 먼저
+    시작한 콜드메일이든 audit 가치 있으면 노트화(가치 판단은 노트 LLM 단계).
     - 라벨 없는 모델: 제거할 라벨도 `9 완료` 부착도 없음(그건 1~8 액션 터미널).
       멱등성 = **스레드 노트 존재**(threadId 가드)뿐.
     - KIRAMS 포워딩 노이즈는 `[KIRAMS-FWD]` 제목표로 제외(designed marker).
-    - 회신만: 스레드에 inbound(받은) 메시지가 있어야 함 (cold mail 제외).
-    - 노트는 *회신 메시지*(원문 인용 포함)로 빌드해 교신 캡처. 단 frontmatter
-      gmail_threadIds 는 canonical threadId 로 덮어써 가드 멱등성 일치.
-    v1 한계: 노트 있는 스레드의 *추가* 회신 미포착 (thread 진화 append 는
+    - 노트는 *보낸 메시지*(회신이면 원문 인용 포함)로 빌드해 교신 캡처. 단
+      frontmatter gmail_threadIds 는 canonical threadId 로 덮어써 가드 멱등 일치.
+    v1 한계: 노트 있는 스레드의 *추가* 메일 미포착 (thread 진화 append 는
     gmail-capture §9.2 로 위임). 라벨핸들러와의 교차 중복은 드물고 주간 §9.2
     감사가 포착. 반환 (full, problem) — 성공 침묵·오류만."""
     query = (f'in:sent -subject:"[KIRAMS-FWD]" -label:"{LABEL_DONE_9}" '
              f'newer_than:{REPLY_SENT_WINDOW_DAYS}d')
     results = gog_json("gmail", "search", query, "--max", str(limit))
     if results is None:
-        _m = "[회신 드레인] gmail 검색 실패 (gog OAuth?)\n"
+        _m = "[보낸메일 드레인] gmail 검색 실패 (gog OAuth?)\n"
         return (_m, _m)
     if isinstance(results, dict):
         results = results.get("messages", results.get("items", []))
@@ -3574,22 +3574,14 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
         if existing is not None:
             continue
 
-        # 회신 판정: 스레드에 inbound(SENT 아닌) 메시지가 있어야 진짜 교신.
-        # 전부 SENT 면 내가 먼저 보낸 cold mail → 제외 (회신만 범위).
-        payload = fetch_thread_full(tid)
-        if payload is None:
-            errors.append(f"{short} (thread fetch 실패)")
-            continue
-        msgs = (payload.get("thread") or {}).get("messages") or []
-        if not any("SENT" not in (mm.get("labelIds") or []) for mm in msgs):
-            continue  # cold mail — 회신 아님
-
+        # 2026-05-16 Dr. Ben: 회신+콜드 전부 — cold mail 제외 체크 + 그 전용
+        # pre-fetch 제거. fetch 실패는 propose_proceed 가 자체 surface.
         if dry_run:
-            planned.append(f"· {short} → [회신 브레인화]")
+            planned.append(f"· {short} → [보낸메일 브레인화]")
             continue
 
-        # 노트: 회신 메시지로 빌드 (이메일 회신 본문은 보통 원문 인용 포함 →
-        # build_companion_note_llm 이 교신 전체를 요약 가능).
+        # 노트: 보낸 메시지로 빌드 (회신이면 본문에 원문 인용 포함 →
+        # build_companion_note_llm 이 교신 전체 요약 가능; 콜드면 보낸 내용).
         item: dict = {"msg_id": reply_id, "from": m.get("from", ""),
                       "subject": subj}
         ok, err = propose_proceed(item)
@@ -3612,15 +3604,15 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
             _save_inject_provenance(note_rel, "internal",
                                     PARSER_VERSION, all_warns)
             # gmail_threadIds 를 canonical threadId 로 덮어써 가드 멱등 일치
-            # + 회신 출처 마커 (라벨 없으니 노트가 유일 기록)
+            # + 보낸메일 출처 마커 (라벨 없으니 노트가 유일 기록)
             p = VAULT_ROOT / note_rel
             if p.exists():
                 try:
                     t = p.read_text(encoding="utf-8")
                     t = _replace_fm_field_list(t, "gmail_threadIds", [tid])
-                    t = _replace_fm_field(t, "brainify_origin", "gmail-reply")
+                    t = _replace_fm_field(t, "brainify_origin", "gmail-sent")
                     t = _replace_fm_field(
-                        t, "reply_brainified_at",
+                        t, "sent_brainified_at",
                         now.isoformat(timespec="seconds"))
                     fd, tmp = tempfile.mkstemp(prefix=".gws-note.",
                                                dir=str(p.parent))
@@ -3644,19 +3636,19 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
 
     if dry_run:
         if not planned:
-            return ("[회신 드레인 — dry-run] 처리 대상 없음\n", "")
-        return ("[회신 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
+            return ("[보낸메일 드레인 — dry-run] 처리 대상 없음\n", "")
+        return ("[보낸메일 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
                 + "\n".join(planned) + "\n", "")
     if not (done or errors):
         return ("", "")
-    lines = ["[회신 브레인화] 자동 처리"]
+    lines = ["[보낸메일 브레인화] 자동 처리"]
     if done:
         lines.append(f"  ✓ 완료 {len(done)}건: " + ", ".join(done))
     if errors:
         lines.append(f"  ✗ 실패 {len(errors)}건: " + "; ".join(errors))
     lines.append("")
     full = "\n".join(lines)
-    prob = (f"[회신] ✗ 실패 {len(errors)}건: " + "; ".join(errors) + "\n"
+    prob = (f"[보낸메일] ✗ 실패 {len(errors)}건: " + "; ".join(errors) + "\n"
             if errors else "")
     return (full, prob)
 

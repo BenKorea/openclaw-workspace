@@ -36,7 +36,7 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | `/gws-assistant pending-review [N]` | 보류 라벨 메일 N건 라벨 제거 후 재분류 plan |
 | `/gws-assistant save-drain [--dry-run] [N]` | §11 `1 저장` 라벨 완전무인 드레인 — 노트 생성+PARA 배치+`9 완료` commit. `--dry-run` 은 mutation 없이 계획만 |
 | `/gws-assistant schedule-drain [--dry-run] [N]` | §11.5 `2 일정` 라벨 완전무인 드레인 — 노트 + **Google Calendar 이벤트** + PARA 배치 + `9 완료`. `--dry-run` 은 계획만 |
-| `/gws-assistant reply-drain [--dry-run] [N]` | §11.5 **회신 브레인화** — 라벨 0마찰. 보낸편지함 폴링 → 진짜 회신(스레드에 inbound 있음, `[KIRAMS-FWD]` 제외) 교신을 노트화. `--dry-run` 은 계획만 |
+| `/gws-assistant reply-drain [--dry-run] [N]` | §11.5 **보낸메일 브레인화** — 라벨 0마찰. 보낸편지함 폴링 → **회신+콜드 전부**(`[KIRAMS-FWD]` 제외), audit 가치로만 필터해 노트화. `--dry-run` 은 계획만 |
 
 ## 출력 처리 규칙
 
@@ -78,7 +78,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - PHI 점검 없음 (2026-05-16): 이 Gmail 계정엔 환자정보 송수신 자체가 없어 미수행. CLAUDE.md 2026-04-24 결정과 일관 — 재도입 금지.
 - 코어 `_run_label_drain` 이 1~8 공용 (label/tag/extra_action 파라미터). `_run_save_drain`(1 저장, extra=없음)·`_run_schedule_drain`(2 일정, extra=Calendar 이벤트)·`_schedule_extra_action`(idempotent — calendar_event_id 있으면 재생성 skip, 크래시-재개 안전).
 - **`2 일정` 출시 (2026-05-16)**: audit 노트 + Calendar 이벤트(`_extract_schedule_from_email`→`_create_calendar_event`→`_attach_schedule_to_note`) + `9 완료`. 일시 추출 실패 시 commit 안 함 + 오류 발화(수동 처리).
-- **회신 브레인화 출시 (2026-05-16, `_run_reply_drain`)**: Dr. Ben 결정 — 회신 시 라벨 안 누름(0마찰). 그래서 `8 회신` 라벨 경로가 아니라 **보낸편지함 폴링** 으로 포착하는 별도 함수. `in:sent -subject:"[KIRAMS-FWD]" -label:"9 완료" newer_than:2d` → 스레드에 inbound 있는 진짜 회신만(cold mail 제외). 노트는 회신 메시지(원문 인용 포함)로 빌드, frontmatter `gmail_threadIds` 를 canonical threadId 로 덮어써 가드 멱등. **라벨 없는 모델**: 제거할 라벨·`9 완료` 부착 없음, 멱등성=노트존재뿐. v1 한계: 노트 있는 스레드의 추가 회신 미포착(§9.2 thread 진화로 위임), 라벨핸들러 교차중복 드묾(주간 §9.2 감사 포착). `brainify_origin: gmail-reply` 마커.
+- **보낸메일 브레인화 출시 (2026-05-16, `_run_reply_drain`)**: Dr. Ben 결정 — 회신 시 라벨 안 누름(0마찰) + **방향 무관(회신+콜드 전부)**. `8 회신` 라벨 경로 아닌 **보낸편지함 폴링**. `in:sent -subject:"[KIRAMS-FWD]" -label:"9 완료" newer_than:2d` → 보낸 메일 전부(내가 먼저 보낸 콜드메일 포함), audit 가치 판단(노트 LLM 단계)으로만 필터. 노트는 보낸 메시지(회신이면 원문 인용 포함)로 빌드, frontmatter `gmail_threadIds` 를 canonical threadId 로 덮어써 가드 멱등. **라벨 없는 모델**: 제거할 라벨·`9 완료` 부착 없음, 멱등성=노트존재뿐. v1 한계: 노트 있는 스레드의 추가 메일 미포착(§9.2 thread 진화로 위임), 라벨핸들러 교차중복 드묾(주간 §9.2 감사 포착). `brainify_origin: gmail-sent` 마커.
 - `3~8` **라벨** 핸들러는 deferred — `extra_action` 추가만으로 확장. 단 회신 기능은 위 무라벨 경로가 커버하므로 `8 회신` 라벨 경로는 사실상 우선순위 낮음(Dr. Ben 회신 시 라벨 안 함).
 
 ### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
