@@ -69,11 +69,11 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 위 3-라벨은 legacy(grandfathered). 신규 메일은 Dr. Ben 이 폰/PC 에서 8-라벨(`1 저장`~`8 회신`)로 직접 분류한다 (gmail-capture.md §11 권위). 본 스킬은 그 중 **`1 저장`만 완전무인 처리**:
 
 - 트리거: cron poll 매 사이클, 게이트 무관 백그라운드. **킬스위치 `state['save_drain_enabled']` (기본 False)** — 검증 후 활성화. 수동: `save-drain [--dry-run]`.
-- **Telegram 정책 (2026-05-16 Dr. Ben)**: 성공(완료/복구)은 **완전 침묵**. **오류·PHI-보류 발생 시에만** 1건 발화. 일일 다이제스트 폐기 — 1~8 잔존은 (2~8 핸들러 완성 후엔) 곧 처리될 in-flight 라 보고가 무의미. `_run_save_drain` 은 `(full, problem)` 반환: 수동 `save-drain` 은 full 전체 출력(터미널), cron 은 problem 만 Telegram.
-- 파이프라인 (크래시-안전): threadId 멱등 가드 → 본문 PHI gate → `propose_proceed`(노트 staging) → 첨부 `parse_attachment` (파서 레지스트리, 현재 internal) → frontmatter `para_review:pending`/`parser_id`/`parser_version` 주입 + 본문 `## 첨부 파싱` append → `_relocate_to_para`(첨부+노트 PARA 이동) → **commit point: `1 저장` 제거 + `9 완료` 부착 (strictly 마지막)**.
+- **Telegram 정책 (2026-05-16 Dr. Ben)**: 성공(완료/복구)은 **완전 침묵**. **오류 발생 시에만** 1건 발화. 일일 다이제스트 폐기 — 1~8 잔존은 (2~8 핸들러 완성 후엔) 곧 처리될 in-flight 라 보고가 무의미. `_run_save_drain` 은 `(full, problem)` 반환: 수동 `save-drain` 은 full 전체 출력(터미널), cron 은 problem 만 Telegram.
+- 파이프라인 (크래시-안전): threadId 멱등 가드 → `propose_proceed`(노트 staging) → 첨부 `parse_attachment` (파서 레지스트리, 현재 internal) → frontmatter `para_review:pending`/`parser_id`/`parser_version` 주입 + 본문 `## 첨부 파싱` append → `_relocate_to_para`(첨부+노트 PARA 이동) → **commit point: `1 저장` 제거 + `9 완료` 부착 (strictly 마지막)**.
 - 멱등성: 라벨 변경이 commit point. 그 전 크래시 시 메일이 `1 저장` 잔류 → 다음 사이클이 threadId 가드로 [복구](라벨만)/[재개](staging 재배치+라벨) 분기.
 - PARA 추론 불확실 시 staging 잔류 + `para_review:pending` → 주간 §11.4 PARA 배치감사가 사후 교정 (낙관적 배치).
-- PHI 의심 시 노트 미작성 + `1 저장` 잔류 + 보고에 surface (수동 확인).
+- PHI 점검 없음 (2026-05-16): 이 Gmail 계정엔 환자정보 송수신 자체가 없어 미수행. CLAUDE.md 2026-04-24 결정과 일관 — 재도입 금지.
 - `2~8` 라벨 후속(회신/할일/일정)은 deferred — 동일 dispatch 패턴으로 확장 (§11.5).
 
 ### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
@@ -84,7 +84,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 | 구분 | 범위 | 운명 |
 |---|---|---|
-| **TARGET** | `save-drain`·§11.5 `2~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·PHI backstop·`_commit_save_label`·`LABEL_SAVE`/`LABEL_DONE_9` | 영구 |
+| **TARGET** | `save-drain`·§11.5 `2~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_save_label`·`LABEL_SAVE`/`LABEL_DONE_9` | 영구 |
 | **SHARED-INFRA** | `propose_proceed`·`_relocate_to_para`·`gog_call/json`·노트/frontmatter/PARA 헬퍼·`fetch_thread_full`·Tasks/Calendar 헬퍼·state | 영구 (레거시 삭제 후 TARGET 전용 잔존) |
 | **LEGACY** (게이트서 일괄 삭제) | 3-라벨 classify→plan→approve 흐름 전체: `cmd_poll` 발화경로·`classify_emails_llm`·`build_plan_items`·`merge_plan`·`approve/confirm/edit/skip/dismiss/cancel`·`reply/reply-task/gtask/schedule/nl`·`correct/reclassify/bulk-reclassify/learn-rules/show-rules`·`awaiting_reply` 큐·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE` 상수·해당 SKILL.md 행 | 게이트 충족 시 |
 | **ONE-SHOT** | `migrate-inbox`·`migrate-brainify-labels` | 1회 사용 후 즉시 삭제 (게이트 무관) |

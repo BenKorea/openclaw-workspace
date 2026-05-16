@@ -3240,18 +3240,9 @@ def _existing_note_for_thread(thread_id: str) -> tuple[pathlib.Path | None, bool
     return (None, False)
 
 
-# ── PHI backstop (§11.3) ──
-# 인간 게이트는 트리아지 시점(Dr. Ben 이 직접 `1 저장` 부착)으로 이동해
-# 구조적으로 해소됨. 아래는 값싼 backstop — 의심 시 노트 작성 보류 + 알림.
-_PHI_PATTERNS = [
-    re.compile(r"\b\d{6}[-\s]?\d{7}\b"),                 # 주민등록번호
-    re.compile(r"환자.{0,8}(등록번호|차트번호|병록번호)"),
-    re.compile(r"\b(MRN|chart\s*no)\b", re.IGNORECASE),
-]
-
-
-def _phi_suspect(text: str) -> bool:
-    return any(p.search(text or "") for p in _PHI_PATTERNS)
+# PHI 점검 없음 (2026-05-16 Dr. Ben): 이 Gmail 계정엔 환자정보 송수신
+# 자체가 없어 backstop 무가치(오탐 리스크만). CLAUDE.md 2026-04-24
+# "PHI 자동 가드 삭제(Ben 이 법 숙지)" 결정과 일관 — 재도입 금지.
 
 
 def _ensure_label_9() -> None:
@@ -3333,7 +3324,7 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
                     limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
     """`1 저장` 큐를 완전무인 드레인 (§11.3). 반환 (full, problem):
     - full    = 전체 요약 (수동 터미널용 — 성공 포함 전부)
-    - problem = 오류/PHI-보류만 (cron→Telegram 용). 정상 성공만이면 ""
+    - problem = 오류만 (cron→Telegram 용). 정상 성공만이면 ""
     Telegram 정책 (2026-05-16 Dr. Ben): 성공은 완전 침묵, 이상 시에만 알림.
     dry_run=True 면 mutation 없이 계획만 (problem 항상 "")."""
     # `-label:"9 완료"` 를 일부러 빼서 자가치유: commit 이 부분 실패해 두 라벨이
@@ -3351,7 +3342,6 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
 
     done: list[str] = []
     repaired: list[str] = []
-    held_phi: list[str] = []
     errors: list[str] = []
     planned: list[str] = []
 
@@ -3402,20 +3392,7 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
                 short if ok else f"{short} (commit 실패: {err})")
             continue
 
-        # ── 신규: 본문 PHI gate (노트 쓰기 전) ──
-        pre = fetch_thread_full(tid)
-        if pre is None:
-            errors.append(f"{short} (thread fetch 실패)")
-            continue
-        pmsg = _pick_target_message(pre, tid)
-        body_probe = ""
-        if pmsg:
-            body_probe = _extract_plain_text(pmsg.get("payload") or {}) \
-                or pmsg.get("snippet", "")
-        if _phi_suspect(body_probe + " " + subj):
-            held_phi.append(short)
-            continue  # 라벨 그대로 — `1 저장` 잔류, 다음 사이클 재평가
-
+        # ── 신규 (PHI 점검 없음 — 위 주석 참조) ──
         if dry_run:
             planned.append(f"· {short} → [신규] 노트 생성+배치+commit")
             continue
@@ -3460,25 +3437,19 @@ def _run_save_drain(state: dict, now: dt.datetime, *,
         return ("[1 저장 드레인 — dry-run] " + str(len(planned)) + "건 계획\n"
                 + "\n".join(planned) + "\n", "")
 
-    if not (done or repaired or held_phi or errors):
+    if not (done or repaired or errors):
         return ("", "")
     lines = ["[1 저장 → 9 완료] 자동 처리"]
     if done:
         lines.append(f"  ✓ 완료 {len(done)}건: " + ", ".join(done))
     if repaired:
         lines.append(f"  ↻ 라벨 복구 {len(repaired)}건: " + ", ".join(repaired))
-    if held_phi:
-        lines.append(f"  ⚠ PHI 의심 보류 {len(held_phi)}건 (수동 확인): "
-                     + ", ".join(held_phi))
     if errors:
         lines.append(f"  ✗ 실패 {len(errors)}건: " + "; ".join(errors))
     lines.append("")
     full = "\n".join(lines)
-    # problem = 오류/PHI-보류만 (성공 done/repaired 는 Telegram 침묵)
+    # problem = 오류만 (성공 done/repaired 는 Telegram 침묵)
     prob: list[str] = []
-    if held_phi:
-        prob.append(f"[1 저장] ⚠ PHI 의심 보류 {len(held_phi)}건 (수동 확인): "
-                    + ", ".join(held_phi))
     if errors:
         prob.append(f"[1 저장] ✗ 실패 {len(errors)}건: " + "; ".join(errors))
     problem = ("\n".join(prob) + "\n") if prob else ""
@@ -3509,7 +3480,7 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     awaiting_msg = _poll_awaiting_replies(state, now)
 
     # §11.3 `1 저장` 완전무인 드레인 — 게이트 무관 (백그라운드).
-    # Telegram 정책 (2026-05-16): 성공은 완전 침묵, 오류/PHI-보류만 발화.
+    # Telegram 정책 (2026-05-16): 성공은 완전 침묵, 오류 시에만 발화.
     # 일일 다이제스트 폐기 — 1~8 잔존은 곧 처리될 in-flight 라 무의미.
     # 킬스위치: state['save_drain_enabled'] (기본 False).
     if state.get("save_drain_enabled"):
