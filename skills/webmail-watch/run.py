@@ -73,11 +73,12 @@ TENANTS: dict[str, TenantConfig] = {
             "otp_submit": "",  # 별도 버튼 ✗ — page.press(otp_input, "Enter") 로 submit
             "inbox_marker": "tbody tr[data-index]",
             "login_form_marker": "#cpw",
-            # listing (P5.1·P5.2 확정). message_id 는 click 후 URL 에서 추출.
-            "row_open_trigger": '[role="button"][tabindex="0"]',
-            "row_from_title": "[title]",
-            "row_subject_text": '[role="button"] span.break-all',
-            # forward UI (P5.3 확정). class 가 build hash 라 텍스트 기반.
+            # listing. MailPlug 새 빌드(2026-05 개편): 행을 열지 않음 — 체크박스 선택 →
+            # 툴바 "전달" 직접. detail URL/메일 열기 단계 ✗. 발신자는 행 내 유일한
+            # span[title] ("이름 <addr>"); 버튼들도 [title] 라 span 한정 필수.
+            "row_from_title": "span[title]",
+            "row_subject_text": "span.break-all",
+            # forward UI. 체크박스 선택 후에만 enabled. class 가 build hash 라 텍스트 기반.
             "forward_button": 'button:has-text("전달")',
             "forward_to_input": "#toRecipients-input",
             "forward_subject_input": "#input-subject",
@@ -164,10 +165,14 @@ def open_context(pw: Playwright, tenant: TenantConfig, headless: bool) -> Browse
         # 옵션 C 채택 후 Chrome PM 의존 제거 → Playwright bundled Chromium 사용 (channel 미지정).
         # WSL headless 환경 안정성 보강.
         headless=headless,
-        # 빠른 환경(예: kimbi RTX 3060)에서 KIRAMS chip 변환/reactive UI 의 timing race 발현 —
-        # action 사이 slow_mo 안전망. env 로 0 override 가능 (디버깅·노트북 OFF).
-        # 2026-05-15 데스크탑 첫 운영 시 발견 (PROGRESS P8.3).
-        slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "300")),
+        # KIRAMS reactive UI(chip 변환·resource-servers 부트스트랩)의 timing race 방어막.
+        # 2026-05-17: 기본 300ms 는 headless·fast 환경서 레이스 재발(에이전트가 KIRAMS
+        # 502 외부장애로 오진한 건이 실제론 이 레이스였음 — demo(slow_mo=800)는 정상
+        # forwarding). demo-검증값 800 으로 상향해 재발 종결. 백그라운드 폴러라
+        # action 당 +Δ 운영 무의미(사람 비대기·시간당 1회). headed/trace/walkthrough 가
+        # demo-전용 과함이고 그건 cron 에 애초 없음 — slow_mo 는 정당한 안전값.
+        # env 로 override 가능(디버깅 0, 추후 측정 기반 하향 시).
+        slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "800")),
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
         args=["--no-sandbox", "--disable-dev-shm-usage"],
@@ -216,8 +221,15 @@ def perform_login(page: Page, tenant: TenantConfig) -> bool:
                 # KIRAMS: 별도 submit 버튼 ✗ — Enter 로 폼 submit. fill() 은 input 이벤트만 발생,
                 # keydown/keypress 가 필요한 사이트는 page.press 로 보강.
                 page.press(sel["otp_input"], "Enter")
+            # MailPlug 새 빌드: OTP 후 /mail 로 redirect 하지만 inbox 테이블이
+            # 자동 렌더링 ✗ → inbox_url 명시 이동 후 marker 확인.
             try:
-                page.wait_for_selector(sel["inbox_marker"], timeout=20_000)
+                page.wait_for_url("**/mail**", timeout=15_000)
+            except PlaywrightTimeoutError:
+                pass
+            page.goto(tenant.inbox_url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                page.wait_for_selector(sel["inbox_marker"], timeout=15_000)
                 return True
             except PlaywrightTimeoutError:
                 return False
@@ -259,22 +271,55 @@ def _wait_for_ui_idle(page: Page, timeout: int = 2_000) -> None:
         log.debug("UI idle wait timeout — continuing")
 
 
-def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
-    """detail page 진입 상태에서 호출. 전달 → 받은편지함 자동 복귀.
+def _wait_toolbar_enabled(page: Page, label: str, timeout: int = 8_000) -> None:
+    """텍스트가 정확히 `label` 인 toolbar 버튼이 enabled 될 때까지 wait.
 
+    MailPlug 새 빌드: 행 체크박스 미선택 시 전달/이동 등 toolbar 버튼이 disabled.
+    """
+    page.wait_for_function(
+        """(lbl) => {
+            const b = [...document.querySelectorAll('button')]
+                .find(x => (x.innerText || '').trim() === lbl);
+            return !!b && !b.disabled;
+        }""",
+        arg=label,
+        timeout=timeout,
+    )
+
+
+def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
+    """받은편지함 listing 상태에서 호출 (MailPlug 새 빌드 모델).
+
+    행 체크박스 선택 → toolbar "전달" → /mail/write compose → 발송 → 받은편지함 복귀.
+    메일을 따로 열지 않음 (구 빌드의 detail page 단계 제거).
     실패 시 예외 raise → caller 가 partial_failure 처리.
     """
     sel = tenant.selectors
 
-    # detail 진입 직후 로딩 오버레이 / 직전 동작의 portal 잔재 정착 wait.
     _wait_for_ui_idle(page)
+
+    # 첫 row 체크박스 선택 → toolbar 활성화
+    page.locator(sel["row_checkbox"]).first.click(timeout=10_000)
+    _wait_toolbar_enabled(page, "전달")
 
     page.locator(sel["forward_button"]).first.click(timeout=10_000)
     page.wait_for_selector(sel["forward_to_input"], timeout=15_000)
 
-    # 제목 prefix 먼저 — chip 입력 단계에서 우발적 form submit 이 발생해도
-    # prefix 가 이미 적용된 상태로 발송되는 안전망.
+    # 제목은 새 빌드에서 비동기로 `[FW]<원제목>` 자동 채움 (compose 진입 직후 ~1s 공백).
+    # 공백 상태에서 prefix 만 넣으면 원제목 유실 → gws-assistant 분류 불가.
+    # 자동 채움 완료(non-empty)까지 wait 후 prefix prepend.
     subject_input = page.locator(sel["forward_subject_input"])
+    try:
+        page.wait_for_function(
+            """(sel) => {
+                const e = document.querySelector(sel);
+                return !!e && e.value.trim().length > 0;
+            }""",
+            arg=sel["forward_subject_input"],
+            timeout=10_000,
+        )
+    except PlaywrightTimeoutError:
+        log.debug("subject auto-fill wait timeout — prefix only")
     current = subject_input.input_value() or ""
     if not current.startswith(SUBJECT_PREFIX):
         subject_input.fill(SUBJECT_PREFIX + current)
@@ -304,7 +349,9 @@ def move_to_gmail_folder(page: Page, tenant: TenantConfig) -> None:
     sel = tenant.selectors
 
     # 첫 row 체크박스 click → 선택 → toolbar 활성화
+    _wait_for_ui_idle(page)
     page.locator(sel["row_checkbox"]).first.click(timeout=10_000)
+    _wait_toolbar_enabled(page, "이동")
 
     page.locator(sel["toolbar_move_button"]).first.click(timeout=10_000)
     page.wait_for_selector(sel["move_dropdown"], timeout=10_000)
@@ -317,17 +364,23 @@ def move_to_gmail_folder(page: Page, tenant: TenantConfig) -> None:
     page.wait_for_selector(sel["inbox_marker"], timeout=15_000)
 
 
-def process_inbox(page: Page, tenant: TenantConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """받은편지함 = pending queue. 위에서부터 poll_limit 건 처리.
+def process_inbox(page: Page, tenant: TenantConfig,
+                  limit: "int | None" = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """받은편지함 = pending queue. 위에서부터 limit(미지정 시 tenant.poll_limit) 건 처리.
 
-    각 회: 첫 row → detail → forward → 받은편지함 복귀 → Gmail 폴더 이동.
+    각 회: 첫 row 메타 추출 → forward(체크박스+전달) → 받은편지함 복귀 → Gmail 이동.
     listing 빔 또는 forward/move 실패 시 break.
+    limit: 수동 on-demand 호출(`--limit N`)이 이번 실행만 건수 오버라이드.
+
+    MailPlug 새 빌드(2026-05): 메일을 여는 detail page/URL 단계 ✗ —
+    체크박스 선택 후 toolbar "전달" 로 직접 compose 진입. message_id 추적 무의미.
     """
     sel = tenant.selectors
     forwarded: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
 
-    for _ in range(tenant.poll_limit):
+    _n = limit if limit is not None else tenant.poll_limit
+    for _ in range(_n):
         _ensure_inbox(page, tenant)
 
         rows = page.locator('tbody tr[data-index="0"]')
@@ -344,15 +397,9 @@ def process_inbox(page: Page, tenant: TenantConfig) -> tuple[list[dict[str, Any]
         except PlaywrightTimeoutError:
             subject_text = ""
 
-        try:
-            row.locator(sel["row_open_trigger"]).first.click(timeout=10_000)
-            page.wait_for_url(tenant.detail_url_re, timeout=15_000)
-        except PlaywrightTimeoutError:
-            failures.append({"id": "?", "subject": subject_text, "error": "row_click_failed"})
-            break
-
-        m = tenant.detail_url_re.search(page.url)
-        mid = m.group(1) if m else "?"
+        # 새 빌드는 메일 열기/ detail URL 단계 ✗ → message_id 추적 무의미.
+        # forwarded 메타용 식별자는 제목으로 충분 (Telegram 침묵 정책).
+        mid = "?"
 
         try:
             forward_via_webmail(page, tenant)
@@ -381,7 +428,7 @@ def notify_telegram(text: str) -> None:
     log.info("notify: %s", text)
 
 
-def cron_run(tenant: TenantConfig) -> Outcome:
+def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
     state = load_state()
     outcome = Outcome()
 
@@ -390,6 +437,14 @@ def cron_run(tenant: TenantConfig) -> Outcome:
         page = ctx.new_page()
         page.goto(tenant.entry_url, wait_until="domcontentloaded", timeout=30_000)
 
+        # MailPlug 새 빌드: entry_url 에서 세션 유효 시 /mail 로 redirect 하지만
+        # inbox 테이블이 자동 렌더링 ✗. 로그인 페이지가 아닌 경우 inbox_url 명시 이동.
+        if "/member/login" not in page.url:
+            try:
+                page.goto(tenant.inbox_url, wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightTimeoutError:
+                pass
+
         if not is_logged_in(page, tenant):
             if not perform_login(page, tenant):
                 outcome.error = "auth_failed"
@@ -397,7 +452,7 @@ def cron_run(tenant: TenantConfig) -> Outcome:
                 return outcome
 
         try:
-            outcome.forwarded, outcome.failures = process_inbox(page, tenant)
+            outcome.forwarded, outcome.failures = process_inbox(page, tenant, limit=limit)
         except Exception as e:
             log.exception("process_inbox 예외")
             outcome.error = f"process_failed: {type(e).__name__}"
@@ -462,8 +517,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="webmail-watch")
     parser.add_argument("tenant", choices=sorted(TENANTS.keys()))
     parser.add_argument("--bootstrap", action="store_true", help="1회 수동 로그인 (headed)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="수동 on-demand: 이번 실행만 forwarding 건수 N "
+                             "(미지정=스케줄 기본 poll_limit=3). 스케줄과 무관하게 즉시 N건.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit 은 1 이상의 정수")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -476,7 +536,7 @@ def main() -> int:
         bootstrap_run(tenant)
         return 0
 
-    outcome = cron_run(tenant)
+    outcome = cron_run(tenant, limit=args.limit)
     return report(tenant, outcome)
 
 

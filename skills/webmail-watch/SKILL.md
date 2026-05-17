@@ -16,6 +16,12 @@ description: 외부 forwarding/IMAP 이 차단된 기관·기업 webmail 을 pol
 ## 입력
 
 - `tenant` (필수): webmail tenant 키. 미지정 시 `kirams` (default).
+- `--limit N` (선택, 2026-05-17): **수동 on-demand** — 이번 실행만 forwarding 건수를 N 으로 오버라이드 (미지정 = 스케줄 기본 `tenant.poll_limit`=3). 수동 호출은 본래 *즉시·스케줄 무관* 이므로, **발화시각이 아니어도 `/webmail-watch kirams --limit N` 으로 즉시 N건 포워딩**. cron 자동발화(인자 없음)는 기본 3건 불변.
+- `--bootstrap` (선택): 1회 수동 로그인(headed). `--verbose`: 디버그 로그.
+
+### cron 발화 (2026-05-17 변경)
+
+`gws-assistant-poll`·cron-inventory 와 별개. schedule = `0 8-18 * * 1-5` (Asia/Seoul) = **평일 08–18시 1시간 간격**(2026-05-17: 30분→1시간, 이어 17→18시 확장; 일 11회). 자동발화 = 기본 3건 forwarding, Telegram 침묵.
 
 ## Tenant registry
 
