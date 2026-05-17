@@ -17,23 +17,8 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | 사용자/cron 메시지 | 실행 |
 |---|---|
 | `/gws-assistant` (cron 폴) | `python3 ~/.openclaw/workspace/skills/gws-assistant/run.py` |
-| `/gws-assistant approve` | `python3 … run.py approve` |
-| `/gws-assistant confirm [thread_id]` | `python3 … run.py confirm [thread_id]` (생략 시 단일 pending_review 자동 보강) |
-| `/gws-assistant edit [thread_id] folder=<경로>` | `python3 … run.py edit [thread_id] folder=…` (경로 변경 후 즉시 종결) |
-| `/gws-assistant skip [thread_id]` | `python3 … run.py skip [thread_id]` |
-| `/gws-assistant dismiss [thread_id]` | `python3 … run.py dismiss [thread_id]` |
-| `/gws-assistant reply [thread_id] [지시]` | `python3 … run.py reply [thread_id] [지시]` (vault+Gmail 검색 → Drafts → awaiting_reply 큐) |
-| `/gws-assistant reply-task [thread_id] [YYYY-MM-DD] [지시]` | `python3 … run.py reply-task …` (reply + Google Tasks 등록 합성) |
-| `/gws-assistant gtask [thread_id] [YYYY-MM-DD] [note...]` | `python3 … run.py gtask …` (Google Tasks 등록 + 즉시 종결, note 토큰은 Tasks notes 에 append) |
-| `/gws-assistant nl [thread_id] <자연어 문장>` | `python3 … run.py nl [thread_id] <자연어…>` (Opus 4.7 → 3종 명령 reply/reply-task/task 변환) |
-| `/gws-assistant correct <thread_id> <proceed\|pending\|noise> [메모]` | `python3 … run.py correct …` |
-| `/gws-assistant reclassify <thread_id> <new_cat> [메모]` | `python3 … run.py reclassify …` |
-| `/gws-assistant bulk-reclassify <id>:<cat> <id>:<cat> …` | `python3 … run.py bulk-reclassify …` |
-| `/gws-assistant learn-rules` / `show-rules` | deterministic 규칙 추출/표시 |
-| `/gws-assistant cancel` / `snooze N` / `status` | plan 폐기 / 발화 보류 / 상태 출력 |
-| `/gws-assistant migrate-inbox [--apply]` | 기존 inbox 노트 일괄 PARA 정리 |
-| `/gws-assistant migrate-brainify-labels [--apply]` | 1회성 — legacy `브레인화/진행` 라벨 → `브레인화/완료` 일괄 promote |
-| `/gws-assistant pending-review [N]` | 보류 라벨 메일 N건 라벨 제거 후 재분류 plan |
+| `/gws-assistant status` | 상태 출력 (last_checked·awaiting_reply·gtasks_list_id 등) |
+| ~~approve·confirm·edit·skip·dismiss·reply·reply-task·gtask·schedule·nl·correct·reclassify·bulk-reclassify·learn-rules·show-rules·snooze·cancel·migrate-inbox·migrate-brainify-labels·pending-review~~ | **레거시 — 2026-05-17 삭제.** 호출 시 deprecation stub(stderr+rc=1). §11 8-라벨 스와이프 + `*-drain` 으로 대체 |
 | `/gws-assistant save-drain [--dry-run] [N]` | §11 `1 저장` 라벨 완전무인 드레인 — 노트 생성+PARA 배치+`9 완료` commit. `--dry-run` 은 mutation 없이 계획만 |
 | `/gws-assistant schedule-drain [--dry-run] [N]` | §11.5 `2 일정` 라벨 완전무인 드레인 — 노트 + **Google Calendar 이벤트** + PARA 배치 + `9 완료`. `--dry-run` 은 계획만 |
 | `/gws-assistant task-drain [--dry-run] [N]` | §11.5 `6 할일` 라벨 완전무인 드레인 — 노트 + **Google Tasks 등록**(Brainify 리스트) + PARA 배치 + `9 완료`. 추출 실패해도 제목 fallback 으로 항상 task 1개. `--dry-run` 은 계획만 |
@@ -87,39 +72,26 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - **`3 일정+할일` 구현 완료 (2026-05-17 dev)**: 순수 terminal 합성 실증 — `_sched_task_extra_action`=`_task_extra_action`+`_schedule_extra_action` 조합뿐(새 로직 0). task 먼저(항상 성공) → schedule(실패 시 `2 일정` 계약대로 commit 차단+발화, 할일은 선확정). 둘 다 기존 멱등 가드 → 합성 자동 멱등. terminal 기본 commit. `_run_sched_task_drain`+`schedule-task-drain`+cron 튜플 1·2·6·3·8·sent-poll. py_compile·clean exit, 행동검증 gog-auth 대기.
 - **`4·5·7` 구현 완료 (2026-05-17 dev) — 8-라벨 멱집합 전부 완성**: `_run_reply_composite_drain(label,tag,pre)` 일반화(8·4·5·7 단일 경로) — `pre`(비-회신 atomic, 실패=reply 전 bail→고아 0)→`_reply_extra_action(src_label=label)`→`commit_fn=_commit_reply_label`. `_reply_extra_action` 에 `src_label` 파라미터(awaiting_reply 에 복합 라벨 기록→`_poll_awaiting_replies` 가 그 라벨 떼고 `9 완료`). pre: 4=schedule/7=task/5=`_sched_task_extra_action`(3 재사용). 수동 `schedule-reply`/`task-reply`/`schedule-task-reply`-drain + cron 튜플 1·2·6·3·8·4·7·5·sent-poll. py_compile·clean exit, 행동검증 gog-auth 대기.
 
-### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
+### 이행 완료 — 구 3-라벨 레거시 삭제됨 (2026-05-17)
 
-본 skill 은 **[구 3-라벨 AI분류 모델] → [§11 8-라벨 인간트리아지 모델]** 이행 중. 전환기엔 양 표면 공존(보존하며 이행). 어느 코드가 transitional 인지·언제 삭제하는지 명시해 mini-sdd 합법화 — open-ended 레거시 보존(폐기 트리거 없음)이 안티패턴.
+본 skill 은 **[구 3-라벨 AI분류 모델] → [§11 8-라벨 인간트리아지 모델]** 이행을 **완료**. 전환기 공존 종료 — 레거시 일괄 삭제.
 
-**표면 분류**
+**Dr. Ben 결단 (2026-05-17)**: 원 폐기 게이트 5조건(autodrain prod 무사고 4주 / 8-라벨 구현 / 스와이프 완전이행 / manual test / 구조격리) 중 1·4·5 우회. 근거: 신 모델 핵심(`6 할일`·`8 회신`·`3 일정+할일` end-to-end 검증, `4·5·7` = 검증 부품 순수 합성) 충분 + **라벨-구동 단일화 수용**(받은편지함은 스와이프 라벨만 브레인화, AI 자동분류+approve 폐지; 보낸메일 sent-poll 은 유지). 감수 리스크: 신 모델 잠복버그 시 폴백 0. 검증-우선 후 삭제.
 
-| 구분 | 범위 | 운명 |
-|---|---|---|
-| **TARGET** | `_run_label_drain` 코어(+`commit_fn` seam)·`save`/`schedule`/`task`/`reply`/`reply-label`-drain·`_run_task_drain`/`_run_reply_label_drain`/`_run_reply_drain`·`_reply_extra_action`/`_commit_reply_label`·라벨-인지 `_poll_awaiting_replies`·`_sched_task_extra_action`/`_run_sched_task_drain`·`_label_query`(+라벨 하이픈형)·`_run_reply_composite_drain`+4·5·7 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_action_label`·`LABEL_SAVE`/`SCHEDULE`/`TASK`/`REPLY`/`DONE_9` | 영구 |
-| **SHARED-INFRA** | `propose_proceed`·`_relocate_to_para`·`gog_call/json`·노트/frontmatter/PARA 헬퍼·`fetch_thread_full`·Tasks/Calendar 헬퍼·state | 영구 (레거시 삭제 후 TARGET 전용 잔존) |
-| **LEGACY** (게이트서 일괄 삭제) | 3-라벨 classify→plan→approve 흐름 전체: `cmd_poll` 발화경로·`classify_emails_llm`·`build_plan_items`·`merge_plan`·`approve/confirm/edit/skip/dismiss/cancel`·`reply/reply-task/gtask/schedule/nl`·`correct/reclassify/bulk-reclassify/learn-rules/show-rules`·`awaiting_reply` 큐·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE` 상수·해당 SKILL.md 행 | 게이트 충족 시 |
-| **ONE-SHOT** | `migrate-inbox`·`migrate-brainify-labels` | 1회 사용 후 즉시 삭제 (게이트 무관) |
+**삭제분 (~2150줄, run.py 4934→2611, grep 실측 경계)**: 3-라벨 classify→plan→approve 전체 — `classify_emails_llm`·`build_plan_items`·`merge_plan`·`fetch_inbox_pending`·`format_plan_message`·`cmd_approve/confirm/edit/skip/dismiss/cancel`·`cmd_draft_reply`·`cmd_gtask`·`cmd_schedule`(인터랙티브)·`cmd_nl`·`cmd_correct/reclassify/bulk_reclassify/learn_rules/show_rules`·`cmd_pending_review`·`finalize_proceed`·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`is_snoozed`·`cmd_snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE`·`LEGACY_LABEL_DUPLICATE`·`CATEGORY_*`·`migrate-inbox/-brainify-labels`(ONE-SHOT) + 전 dispatch.
 
-> 2026-05-16 Dr. Ben 확정: AI분류 튜닝군(`correct`/`learn-rules` 등)은 8-라벨선 인간이 분류하므로 전부 LEGACY. gates/`snooze` 도 LEGACY — 자동드레인은 게이트 무관이라 레거시 제거 시 소비자 0.
+**수술 보존 (TARGET, 레거시 분기만 절제)**: `cmd_poll`(레거시 classify 분기 제거 → `_poll_awaiting_replies`+autodrain 만), `_poll_awaiting_replies`(grandfather fallback 제거 → new-only `9 완료` promote).
 
-**폐기 게이트 트리거 (AND — 전부 충족 시에만 LEGACY 삭제)**
+**경계 도출의 교훈**: mini-sdd LEGACY 목록이 *stale* 했음 — 이번 세션 신 모델이 `awaiting_reply`·`_poll_awaiting_replies`·`cmd_poll`·`propose_proceed`·`_pick_target_in_thread`·`_attach_draft_to_note`·`fetch_thread_full` 을 load-bearing 으로 co-opt. 목록 맹신 시 신 모델 파손. **AST transitive 자동폐쇄도 과삭제**(main/dispatch 중심성으로 신모델 명령·core 까지 흡수) → 폐기, 명시 큐레이션 60함수 + KEEP-참조 안전검증으로 확정. (이번 세션 "추측이 매번 졌다" 7번째.)
 
-1. `autodrain_enabled=true` 로 자동드레인(활성 핸들러 전체) prod **무사고 ≥ 4주** (또는 무사고 사이클 ≥ 20) — 단일 플래그라 1~8 통합 검증 시계 1개
-2. §11.5 8-라벨 멱집합 **전부 구현 완료** (`2 일정` 2026-05-16; `6 할일`·`8 회신`·sent-poll·`3 일정+할일`·`4·5·7` 2026-05-17 dev) — 남은 건 **행동검증(gog-auth 런타임)** + 배포 cutover; 코드 구현 갭 없음
-3. Dr. Ben 실제 트리아지가 8-라벨 스와이프로 완전 이행 (구 "AI분류+Telegram approve" 가 더 이상 작업흐름 아님 — 운영 확인)
-4. 신 모델 SKILL.md manual test commands 전부 통과 (회귀 안전망)
-5. (구조 선행조건) `run.py` 관심사별 분해되어 LEGACY 가 **단일 모듈로 격리** → 삭제 = 모듈+dispatch 제거
+**검증**: py_compile 통과 + 회귀 스모크(legacy stub rc=1 / status / 8 핸들러 dry-run NameError 0 / cmd_poll 무크래시). 잔여 = 배포 cutover + gog-auth 행동검증(Dr. Ben 검증-충분 판단).
 
-**삭제 절차 (게이트 충족 후, 독자 mini-sdd 단위)**
-
-- spec: "LEGACY 모듈+dispatch+`LABEL_*` 상수+SKILL.md 레거시 행 제거, 동작보존(TARGET 무영향)"
-- acceptance: 신 모델 manual test 전부 통과 + 레거시 명령은 명시적 deprecation stub 반환
-- 핸드오프: `/cron off → 삭제 → 단위테스트 → /git-routine sync → /cron on → smoke test` (openclaw-skill-dev.md 워크플로우)
+**잔존 정리(선택)**: `cmd_status` 가 vestigial `pending_plan`/`snooze_until` 표시(graceful, 무해 — cosmetic).
 
 ### 폴링 (cron, 평일 30분)
 
 매 사이클:
-1. **awaiting_reply 큐 처리** — 게이트 무관, 항상 실행. 각 항목의 thread 에서 drafted_at 이후 SENT 라벨 메시지 검출 시 자동 promote (`브레인화/진행` → `브레인화/완료`) + 노트에 `replied_at` 기록 + 큐에서 제거.
+1. **awaiting_reply 큐 처리** — 게이트 무관, 항상 실행. 각 항목의 thread 에서 drafted_at 이후 SENT 라벨 메시지 검출 시 자동 promote (트리거 라벨 `8/4/5/7` 제거 + `9 완료` 부착) + 노트에 `replied_at` 기록 + 큐에서 제거.
 2. **게이트 체크** — 평일/근무시간/공휴일/미팅중-`판독`예외. 실패 시 새 메일 발화 안 함 (단 awaiting_reply 결과는 출력).
 3. **분류** — 휴리스틱(from 패턴 매칭) → `noise` 자동. 나머지는 Haiku batch 호출 → `proceed`/`pending`/`noise`. vault `gmail-capture.md` §1·§2 동적 주입.
 4. **plan merge & 발화** — 신규 msg 가 plan 에 추가되면 한 메시지로 발화.
