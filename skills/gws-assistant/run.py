@@ -110,6 +110,12 @@ LEGACY_LABEL_DUPLICATE = "브레인화/중복"
 LABEL_SAVE = "1 저장"        # {} 행동 없음 — audit 동반 노트 + archive
 LABEL_DONE_9 = "9 완료"      # 터미널 표식 (기계 검증된 완료). legacy LABEL_DONE 와 무충돌.
 LABEL_SCHEDULE = "2 일정"    # {일정} — audit 노트 + Google Calendar 이벤트 (§11.5)
+LABEL_TASK = "6 할일"        # {할일} — audit 노트 + Google Tasks (§11.5)
+LABEL_REPLY = "8 회신"       # {회신} — 초안 작성 + 2단계 비-terminal 종결 (§11.5 spec-lock 2026-05-17)
+LABEL_SCHED_TASK = "3 일정+할일"  # {일정,할일} — 2·6 순수 terminal 합성 (§11.5)
+LABEL_SCHED_REPLY = "4 일정+회신"       # {일정,회신} — 2+8, 2단계 비-terminal (§11.5)
+LABEL_SCHED_TASK_REPLY = "5 일정+할일+회신"  # {일정,할일,회신} — 2+6+8 (§11.5)
+LABEL_TASK_REPLY = "7 할일+회신"        # {할일,회신} — 6+8, 2단계 비-terminal (§11.5)
 GMAIL_SAVE_MAX = 8           # 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
 REPLY_SENT_WINDOW_DAYS = 2   # 회신 브레인화: 보낸편지함 스캔 윈도우 (멱등이 중복 차단)
 # 파서 추상화 provenance (§11.3). provider 교체 시 _parser_* 가 자기 id/version 반환.
@@ -1108,8 +1114,33 @@ def _attachment_dir(thread_id: str) -> pathlib.Path:
     return VAULT_ATTACH_ROOT / thread_id
 
 
+_LABEL_ID_CACHE: dict[str, "str | None"] = {}
+
+
+def _resolve_label_id(name: str) -> "str | None":
+    """사용자 라벨 *이름* → Gmail 라벨 *ID* 해석. 프로세스 캐시.
+    2026-05-17 진단: gog 의 per-message `labelIds` 는 사용자 라벨을
+    `Label_xxxx` **ID** 로 반환(검색·thread-level 만 이름). 따라서 멀티-
+    메시지 대상 선택을 이름으로 매칭하면 항상 실패 → ID 해석 필요.
+    시스템 라벨(SENT/INBOX 등)은 labels list 에 id==name 으로 있거나,
+    없어도 호출부가 이름 매칭 병행하므로 무해. 실패 시 None."""
+    if name in _LABEL_ID_CACHE:
+        return _LABEL_ID_CACHE[name]
+    lid: "str | None" = None
+    out = gog_json("gmail", "labels", "list")
+    if isinstance(out, dict):
+        out = out.get("labels", out.get("items", []))
+    for L in out or []:
+        if isinstance(L, dict) and L.get("name") == name:
+            lid = L.get("id")
+            break
+    _LABEL_ID_CACHE[name] = lid
+    return lid
+
+
 def _pick_target_in_thread(thread_payload: dict, label: str) -> dict | None:
-    """라벨-인지 대상 메시지 선택 (2026-05-16 wrong-message 버그 수정).
+    """라벨-인지 대상 메시지 선택 (2026-05-16 wrong-message 버그 수정;
+    2026-05-17 ID-인지 매칭 보강).
     gog 검색은 thread 단위(메시지 id 없음) → 스레드 안에서 트리거 라벨이
     실제 붙은 메시지를 골라야 함. `_pick_target_message` 의 silent msgs[0]
     fallback 이 '엉뚱한(첫) 메시지로 노트 생성' 의 근원이었음.
@@ -1117,15 +1148,23 @@ def _pick_target_in_thread(thread_payload: dict, label: str) -> dict | None:
     - 멀티: labelIds 에 label 든 메시지(복수면 최신 internalDate).
       label='SENT' 는 시스템 라벨(신뢰) = 최신 보낸 메시지(=내 회신).
     - 못 찾으면 **None** (호출자가 skip+report — silent 오귀속 금지).
-    주의: 사용자 라벨이 labelIds 에 *이름* 으로 오는 전제(gog 는 이름 기반;
-    thread-level `labels` 도 이름). id 라면 멀티는 None→안전 skip(오염 X)."""
+    **ID-인지 (2026-05-17)**: gog 가 per-message labelIds 를 사용자 라벨
+    *ID* 로 반환하므로 이름만 매칭하면 멀티-메시지 항상 None(1·2·6·8 공통
+    구조 결함이었음). `_resolve_label_id` 로 이름→ID 해석 후 *이름 OR ID*
+    매칭. 선택 전략(라벨 붙은 그 메시지)은 불변 — 실측상 Dr. Ben 은 최신이
+    아닌 특정 메시지(원 요청)에 라벨하므로 latest 폴백은 오귀속이라 채택 안 함."""
     thread = thread_payload.get("thread") or {}
     msgs = thread.get("messages") or []
     if not msgs:
         return None
     if len(msgs) == 1:
         return msgs[0]
-    cands = [m for m in msgs if label in (m.get("labelIds") or [])]
+    lid = _resolve_label_id(label)        # 사용자 라벨은 gog 가 ID 로 줌
+    cands = [
+        m for m in msgs
+        if label in (m.get("labelIds") or [])
+        or (lid is not None and lid in (m.get("labelIds") or []))
+    ]
     if not cands:
         return None
     cands.sort(key=lambda m: int(m.get("internalDate", "0") or "0"))
@@ -2194,9 +2233,7 @@ def cmd_draft_reply(state: dict, now: dt.datetime, argv: list[str],
     if out_json is None or out_json == []:
         print("[브레인화 답장 실패] gog drafts create 실패. 큐 상태 유지.")
         return 0
-    draft_id = ""
-    if isinstance(out_json, dict):
-        draft_id = out_json.get("id") or ""
+    draft_id = _draft_id_from_create(out_json)  # 응답 키=draftId (구 `id` 버그)
 
     _attach_draft_to_note(item, draft_id)
 
@@ -2207,7 +2244,7 @@ def cmd_draft_reply(state: dict, now: dt.datetime, argv: list[str],
         actual_due = user_due or _extract_due_from_email(item, now)
         gt_notes = (
             f"From: {frm}\n"
-            f"Thread: https://mail.google.com/mail/u/0/#inbox/{thread_id}\n"
+            f"Thread: https://mail.google.com/mail/u/0/#all/{thread_id}\n"
             f"Vault: {item.get('note_path', '')}\n"
             f"Draft: {draft_id}"
         )
@@ -2382,7 +2419,7 @@ def cmd_gtask(state: dict, now: dt.datetime, argv: list[str]) -> int:
     msg_id = item.get("msg_id", "")
     notes = (
         f"From: {item.get('from', '')}\n"
-        f"Thread: https://mail.google.com/mail/u/0/#inbox/{msg_id}\n"
+        f"Thread: https://mail.google.com/mail/u/0/#all/{msg_id}\n"
         f"Vault: {item.get('note_path', '')}"
     )
     if note_extra:
@@ -2581,7 +2618,7 @@ def _create_calendar_event(ev: dict, thread_id: str, note_rel: str) -> tuple[str
     사람 기준 포함 종료일을 그대로 넘기면 하루 짧게 표시됨(예 9.8~9.12 →
     9.8~9.11). all_day 면 종료일 +1 (단일일 포함). 시간 있는 이벤트는 무관."""
     description = (
-        f"Gmail thread: https://mail.google.com/mail/u/0/#inbox/{thread_id}\n"
+        f"Gmail thread: https://mail.google.com/mail/u/0/#all/{thread_id}\n"
         f"Vault note: {note_rel}"
     )
     start = ev["start"]
@@ -2607,6 +2644,111 @@ def _create_calendar_event(ev: dict, thread_id: str, note_rel: str) -> tuple[str
     if isinstance(out, dict) and out.get("id"):
         return (out["id"], "")
     return (None, f"calendar create 응답 비정상: {out}")
+
+
+def _extract_task_from_email(item: dict, now: dt.datetime) -> dict:
+    """노트 ## 요약 + 원본 메일에서 할 일(action) 1개 추출 (Opus 4.7).
+    `6 할일` 은 Dr. Ben 이 이미 '할 일' 로 분류한 메일 — 추출 실패해도
+    제목을 fallback 으로 항상 task 1개를 만든다 (일정과 달리 None 없음).
+    Returns {title, due, detail}. due 는 '' 또는 'YYYY-MM-DD'."""
+    subj = (item.get("subject") or "").strip()
+    fallback = {"title": subj or "(제목 없음)", "due": "", "detail": ""}
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return fallback
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return fallback
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    summary_section = _extract_summary_section(text, max_lines=30) or ""
+    body_section = ""
+    body_marker = text.find("## 원본 메일")
+    if body_marker >= 0:
+        body_section = text[body_marker: body_marker + 4000]
+    today_iso = now.date().isoformat()
+    prompt = (
+        f"오늘 날짜: {today_iso} (KST, +09:00)\n\n"
+        "다음 메일이 Dr. Ben 에게 요구하는 '할 일'(행동) 1개를 추출하라.\n"
+        "- title: 동사로 시작하는 한국어 한 줄 행동 "
+        "(예 '학회 초록 제출', '계약서 검토 후 회신').\n"
+        "- due: 마감일이 본문에 명시되면 'YYYY-MM-DD', 없으면 빈 문자열.\n"
+        "- detail: 보조 맥락 한두 줄 (없으면 빈 문자열).\n"
+        "응답은 JSON 객체 한 줄만. 다른 텍스트·코드블록·해설 금지.\n"
+        '예: {"title":"학회 초록 제출","due":"2026-05-31",'
+        '"detail":"KSNM 춘계 온라인 제출 시스템"}\n\n'
+        f"[메일 제목] {subj}\n"
+        f"[발신] {item.get('from', '')}\n"
+        f"[요약]\n{summary_section[:2500]}\n\n"
+        f"[본문 발췌]\n{body_section[:2500]}\n"
+    )
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-opus-4-7",
+        "--disallowedTools", "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True,
+                           text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return fallback
+    if r.returncode != 0:
+        return fallback
+    out = (r.stdout or "").strip()
+    if out.startswith("```"):
+        nl = out.find("\n")
+        out = out[nl + 1:] if nl >= 0 else ""
+        if out.rstrip().endswith("```"):
+            out = out.rstrip()[:-3]
+        out = out.strip()
+    try:
+        parsed = json.loads(out)
+    except json.JSONDecodeError:
+        try:
+            s = out.index("{")
+            e = out.rindex("}") + 1
+            parsed = json.loads(out[s:e])
+        except (ValueError, json.JSONDecodeError):
+            return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+    title = (parsed.get("title") or subj or "").strip() or "(제목 없음)"
+    due = (parsed.get("due") or "").strip()
+    if due and not _DATE_RE.match(due):
+        due = ""          # LLM 형식 일탈 → 마감 없음 취급 (할 일은 마감 선택)
+    return {"title": title, "due": due,
+            "detail": (parsed.get("detail") or "").strip()}
+
+
+def _attach_task_to_note(item: dict, task_id: str, te: dict) -> None:
+    """노트 frontmatter 에 google_task_id / google_task_due 기록 (best-effort).
+    schedule 핸들러의 calendar_event_id 가드와 평행 — §11.5 cron 핸들러 내부
+    일관성 유지 (§10 인터랙티브 경로의 gtask_id·복수형 google_task_ids 와는
+    별개의 무인 cron 단발 필드)."""
+    note_rel = item.get("note_path")
+    if not note_rel:
+        return
+    note_path = VAULT_ROOT / note_rel
+    if not note_path.exists():
+        return
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    text = _replace_fm_field(text, "google_task_id", task_id)
+    text = _replace_fm_field(text, "google_task_due", te.get("due", ""))
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".gws-note.", dir=str(note_path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, note_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, NameError):
+            pass
 
 
 def cmd_schedule(state: dict, now: dt.datetime, argv: list[str]) -> int:
@@ -3153,10 +3295,14 @@ def _poll_awaiting_replies(state: dict, now: dt.datetime) -> str:
         if not sent_after_draft:
             still_pending.append(entry)
             continue
+        # phase-2 promote — 라벨-인지. `8 회신`(신 모델)은 src_label/terminal
+        # 동반: `9 완료` 부착 + `8 회신` 제거. LEGACY 엔트리(필드 없음)는
+        # 기존대로 `브레인화/완료` + `브레인화/진행` 제거 (무충돌 grandfather).
+        _add = entry.get("terminal") or LABEL_DONE
+        _rm = entry.get("src_label") or LABEL_PROCEED
         ok, _err = gog_call(
             "gmail", "labels", "modify", thread_id,
-            "--add", LABEL_DONE,
-            "--remove", LABEL_PROCEED,
+            "--add", _add, "--remove", f"{_rm},INBOX",
         )
         if not ok:
             still_pending.append(entry)
@@ -3183,7 +3329,11 @@ def _poll_awaiting_replies(state: dict, now: dt.datetime) -> str:
     state["awaiting_reply"] = still_pending
     if not promoted:
         return ""
-    lines = [f"[발송 감지 → 자동 종결] {len(promoted)}건 ('{LABEL_PROCEED}' → '{LABEL_DONE}')"]
+    _v2 = sum(1 for e in promoted if e.get("src_label"))
+    _kind = (f"`{LABEL_REPLY}`→`{LABEL_DONE_9}`" if _v2 == len(promoted)
+             else f"`{LABEL_PROCEED}`→`{LABEL_DONE}`" if _v2 == 0
+             else "혼합")
+    lines = [f"[발송 감지 → 자동 종결] {len(promoted)}건 ({_kind})"]
     for e in promoted:
         subj = (e.get("subject") or "").strip() or "(제목 없음)"
         lines.append(f"  · {_short_subject(subj, 50)}")
@@ -3370,9 +3520,20 @@ def _save_append_parsed(note_rel: str, parsed: list[tuple[str, dict]]) -> None:
             pass
 
 
+def _label_query(label: str) -> str:
+    """Gmail `q` 의 `label:` 연산자 형식. 2026-05-17 실측: `+` 포함 라벨은
+    인용형 `label:"…"` 이 0건(`+` 가 q 파서서 깨짐), **공백→하이픈 unquoted**
+    (`label:3-일정+할일`)이 적중. `+` 없는 라벨(1·2·6·8)은 인용형이 검증됨.
+    검증된 형식만 사용해 회귀 방지 위해 분기 (4·5·7 도 `+` 라 선재 커버)."""
+    if "+" in label:
+        return "label:" + label.replace(" ", "-")
+    return f'label:"{label}"'
+
+
 def _run_label_drain(state: dict, now: dt.datetime, *,
                      label: str, tag: str,
                      extra_action=None,
+                     commit_fn=None,
                      dry_run: bool = False,
                      limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
     """§11 액션-라벨 완전무인 드레인 코어 (1~8 공용).
@@ -3382,10 +3543,22 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
                   콜백 (item, now)->(ok, err). None 이면 없음.
                   **idempotent 필수** — 크래시 후 재개 시 재호출되므로
                   (예: 이미 만든 캘린더 이벤트 재생성 금지).
+    commit_fn: 최종 커밋 콜백 (thread_id, label)->(ok, err). None → terminal
+               `_commit_action_label`(라벨 제거 + `9 완료`). `8 회신` 은
+               2단계 비-terminal 이라 `_commit_reply_label`(archive 만, 라벨
+               유지 → 발송 감지 후 `_poll_awaiting_replies` 가 `9 완료` promote).
+    awaiting_reply 큐에 있는 tid 는 skip — 초안 발송 대기 중인 `8 회신` 항목이
+    매 사이클 재처리·재공지되는 것 방지 (1/2/6 은 큐 비어 무영향).
     반환 (full, problem): full=전체요약(터미널), problem=오류만(cron→Telegram).
     `-label:"9 완료"` 미포함 — commit 부분실패 stuck 도 가드로 자가치유.
-    Telegram 정책: 성공 침묵, 오류만. dry_run=계획만 (problem 항상 "")."""
-    query = f'label:"{label}"'
+    Telegram 정책: 성공 침묵, 오류만 (`8 회신` 만 §11.5 명문화 예외 — 호출
+    래퍼 `_run_reply_label_drain` 이 사이클당 1건 요약을 problem 에 합성)."""
+    if commit_fn is None:
+        commit_fn = _commit_action_label
+    _awaiting_ids = {e.get("msg_id")
+                     for e in (state.get("awaiting_reply") or [])
+                     if e.get("msg_id")}
+    query = _label_query(label)
     results = gog_json("gmail", "search", query, "--max", str(limit))
     if results is None:
         _m = f"[{tag} 드레인] gmail 검색 실패 (gog OAuth?)\n"
@@ -3412,15 +3585,35 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
         short = _short_subject(subj, 50)
         if not tid:
             continue
+        # 발송 대기 중(`8 회신` 초안 등록됨) → skip. 매 사이클 재처리·재공지
+        # 방지. state 유실 시 큐 비어 → 가드 경로로 재진입해 멱등 복구(수렴).
+        if tid in _awaiting_ids:
+            continue
 
         # ── threadId 멱등 가드 ──
         existing, relocated = _existing_note_for_thread(tid)
         if existing is not None and relocated:
-            # 노트+이동 끝 (extra_action 도 끝남), 라벨만 미완 → commit 복구
+            # 노트+이동 끝, 라벨만 미완 → **액션-인지 복구** (2026-05-17 Dr. Ben).
+            # 과거: relocated 노트 존재 = extra_action 도 끝났다고 가정하고
+            # 라벨만 commit → 다른 핸들러/무액션 캡처가 만든 노트면 이 라벨의
+            # 액션(Task/이벤트)이 조용히 누락되는 크로스-핸들러 사각지대.
+            # 수정: extra_action 을 호출(이미 멱등 — frontmatter 의
+            # google_task_id/calendar_event_id 마커 있으면 self-skip, 없으면
+            # 보강). extra_action 자체가 곧 '액션-인지 술어'. 노트·첨부·PARA
+            # 이동은 끝났으므로 그 단계만 skip (재생성/재배치 안 함).
             if dry_run:
-                planned.append(f"· {short} → [복구] 라벨 commit 만")
+                _aw = " (액션 보강 idempotent)" if extra_action else ""
+                planned.append(f"· {short} → [복구]{_aw} + 라벨 commit")
                 continue
-            ok, err = _commit_action_label(tid, label)
+            if extra_action is not None:
+                ritem = {"msg_id": tid, "from": m.get("from", ""),
+                         "subject": subj,
+                         "note_path": str(existing.relative_to(VAULT_ROOT))}
+                ok, err = extra_action(ritem, now)   # 멱등: 마커 있으면 skip
+                if not ok:
+                    errors.append(f"{short} (액션 보강 실패: {err})")
+                    continue
+            ok, err = commit_fn(tid, label)
             (repaired if ok else errors).append(
                 short if ok else f"{short} (라벨 복구 실패: {err})")
             continue
@@ -3450,7 +3643,7 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
                 if not ok:
                     errors.append(f"{short} (재배치 실패: {err})")
                     continue
-            ok, err = _commit_action_label(tid, label)
+            ok, err = commit_fn(tid, label)
             (done if ok else errors).append(
                 short if ok else f"{short} (commit 실패: {err})")
             continue
@@ -3499,7 +3692,7 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
         # para 비면 staging 잔류 — para_review:pending + 주간 §11.4 감사가 배치
 
         # commit point (strictly 마지막)
-        ok, err = _commit_action_label(tid, label)
+        ok, err = commit_fn(tid, label)
         (done if ok else errors).append(
             short if ok else f"{short} (commit 실패: {err})")
 
@@ -3568,6 +3761,380 @@ def _run_schedule_drain(state: dict, now: dt.datetime, *,
     return _run_label_drain(state, now, label=LABEL_SCHEDULE, tag="2 일정",
                             extra_action=_schedule_extra_action,
                             dry_run=dry_run, limit=limit)
+
+
+def _task_extra_action(item: dict, now: dt.datetime,
+                       state: dict) -> tuple[bool, str]:
+    """`6 할일` 추가 액션 — 노트에서 할 일 추출 → Google Tasks 등록.
+    **idempotent**: 노트 frontmatter 에 google_task_id 가 이미 있으면
+    재생성 안 함 (크래시 후 재개 시 중복 task 방지). schedule 핸들러의
+    calendar_event_id 가드와 평행.
+    일정과 달리 추출이 실패해도 제목 fallback 으로 항상 task 1개 생성 —
+    `6 할일` 라벨 자체가 Dr. Ben 의 '이건 할 일' 결정이므로 commit 막지 않음."""
+    note_rel = item.get("note_path")
+    if note_rel:
+        p = VAULT_ROOT / note_rel
+        if p.exists():
+            try:
+                fm = _parse_frontmatter(p.read_text(encoding="utf-8"))
+                if fm.get("google_task_id"):
+                    return (True, "")          # 이미 생성됨 (재개 경로)
+            except OSError:
+                pass
+    te = _extract_task_from_email(item, now)
+    tid = item.get("msg_id", "")
+    notes = (f"Gmail thread: https://mail.google.com/mail/u/0/#all/{tid}\n"
+             f"Vault note: {note_rel or '(노트 없음)'}")
+    if te.get("detail"):
+        notes = te["detail"] + "\n\n" + notes
+    task_id = create_gtask(state, te["title"], notes, te.get("due") or None)
+    if not task_id:
+        return (False, "Google Tasks 생성 실패 (gog OAuth/네트워크?)")
+    _attach_task_to_note(item, task_id, te)
+    return (True, "")
+
+
+def _run_task_drain(state: dict, now: dt.datetime, *,
+                    dry_run: bool = False,
+                    limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`6 할일` (={할일}) — audit 노트 + Google Tasks + 9 완료 (§11.5).
+    extra_action 은 state(gtasks_list_id 캐시·자동생성) 가 필요해 closure 로
+    바인딩 — `_run_label_drain` 의 (item, now) 콜백 계약은 그대로 유지."""
+    return _run_label_drain(
+        state, now, label=LABEL_TASK, tag="6 할일",
+        extra_action=lambda it, n: _task_extra_action(it, n, state),
+        dry_run=dry_run, limit=limit)
+
+
+def _sched_task_extra_action(item: dict, now: dt.datetime,
+                             state: dict) -> tuple[bool, str]:
+    """`3 일정+할일` 추가 액션 — `6 할일`·`2 일정` atomic 합성 (순수 terminal).
+    **새 추출/등록 로직 없음** — `_task_extra_action`+`_schedule_extra_action`
+    조합만. 둘 다 멱등(google_task_id / calendar_event_id frontmatter 가드)
+    이라 합성도 자동 멱등(재개·액션-인지 가드서 각자 self-skip/보강).
+    순서 = **task 먼저**: task 는 항상 성공(제목 fallback)이라 먼저 확정해
+    두면, 일시 추출 실패로 schedule 이 commit 보류(=`2 일정` 계약)돼도 할일
+    절반은 유실 안 됨. 재개 시 task 는 마커로 self-skip, schedule 만 재시도.
+    schedule 실패 → (False,err) 전파: commit 차단 + 오류 발화(`2 일정` 와
+    동일 — 메일에 명확한 일시 없으면 수동 처리 필요)."""
+    ok, err = _task_extra_action(item, now, state)
+    if not ok:
+        return (False, f"할일 부분 실패: {err}")
+    ok, err = _schedule_extra_action(item, now)
+    if not ok:
+        return (False, f"일정 부분 실패: {err}")
+    return (True, "")
+
+
+def _run_sched_task_drain(state: dict, now: dt.datetime, *,
+                          dry_run: bool = False,
+                          limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`3 일정+할일` (={일정,할일}) — Google Tasks + Calendar 이벤트 + 9 완료
+    (§11.5). 회신 미포함 → **순수 terminal**: commit_fn 기본
+    `_commit_action_label`(라벨 제거 + `9 완료`). extra_action 이 state(task
+    gtasks_list_id 캐시) 필요해 closure 바인딩(`_run_task_drain` 패턴)."""
+    return _run_label_drain(
+        state, now, label=LABEL_SCHED_TASK, tag="3 일정+할일",
+        extra_action=lambda it, n: _sched_task_extra_action(it, n, state),
+        dry_run=dry_run, limit=limit)
+
+
+def _commit_reply_label(thread_id: str, src_label: str) -> tuple[bool, str]:
+    """`8 회신` phase-1 커밋 — **archive 만, 라벨 유지** (비-terminal).
+    `9 완료` 안 박고 `8 회신` 도 안 떼어냄: 발송 전엔 미완. INBOX 만 제거해
+    받은편지함에서 내림. `8 회신` 은 *persistent 중간상태 마커* 로 남아
+    crash 복구(state 유실 시 재진입 → `gmail_draft_id` 가드로 멱등) 보장.
+    phase-2 = `_poll_awaiting_replies` 가 발송 감지 후 `9 완료` promote +
+    `8 회신` 제거. (드레인 재처리는 awaiting_reply skip 필터가 차단.)"""
+    return gog_call("gmail", "labels", "modify", thread_id, "--remove", "INBOX")
+
+
+def _find_existing_draft_for_thread(thread_id: str) -> "str | None":
+    """스레드에 이미 만들어진 초안의 draftId 조회 (Gmail-레벨 멱등 안전망).
+    frontmatter 마커가 못 쓰인 창(초안 생성 성공 후 마커 기록 전 크래시/
+    에러)에서 재시도 시 **중복 초안** 방지 — `calendar_event_id`/
+    `google_task_id` 와 같은 외부-부작용 멱등성 원칙. gog drafts list 에
+    threadId 필터가 없어 전체 조회 후 message.threadId 매칭. 없으면 None."""
+    out = gog_json("gmail", "drafts", "list")
+    if isinstance(out, dict):
+        out = out.get("drafts", out.get("items", []))
+    for d in out or []:
+        if not isinstance(d, dict):
+            continue
+        # gog drafts list 실측 구조 = flat {id, messageId, threadId}
+        # (2026-05-17). 중첩 message.threadId 는 다른 gog 버전 대비 폴백.
+        tid = d.get("threadId") or (d.get("message") or {}).get("threadId")
+        if tid == thread_id:
+            return d.get("id") or d.get("draftId")
+    return None
+
+
+def _draft_id_from_create(out_json) -> str:
+    """gog `drafts create` 응답에서 draftId 추출. 실제 응답 형태(2026-05-17
+    실측): {'draftId': 'r…', 'message': {'id':…,'threadId':…}, 'threadId':…}.
+    send/delete 가 쓰는 정본 = top-level `draftId`. 폴백: message.id → id."""
+    if not isinstance(out_json, dict):
+        return ""
+    return (out_json.get("draftId")
+            or (out_json.get("message") or {}).get("id")
+            or out_json.get("id") or "")
+
+
+def _reply_extra_action(item: dict, now: dt.datetime, state: dict,
+                        drafted: list,
+                        src_label: str = LABEL_REPLY) -> tuple[bool, str]:
+    """회신 초안 추론 → Gmail Drafts → awaiting_reply 등록 (`8 회신` 및 회신
+    포함 복합 `4·5·7` 공용). LEGACY `cmd_draft_reply` 기계 재배선(무인화).
+    **idempotent**: 노트 frontmatter `gmail_draft_id` 있으면 재초안 안 함
+    (awaiting_reply 엔트리만 보강해 crash 복구).
+    src_label: 트리거 라벨 — awaiting_reply 엔트리에 기록해 `_poll_awaiting_
+    replies` 가 발송감지 시 *그 라벨*(`8 회신`/`4 일정+회신`/…)을 떼고
+    `9 완료` 부착하게 함. 복합서 `8 회신` 하드코딩이면 엉뚱한 라벨 제거됨.
+    drafted: 이번 사이클 *신규* 초안 short 제목 누적 (§11.5 silent-on-
+    success 예외 — 사이클당 1건 요약용; 멱등 skip 분은 미누적)."""
+    note_rel = item.get("note_path")
+    thread_id = item.get("msg_id", "")
+    if not note_rel or not thread_id:
+        return (False, "노트 경로/스레드 ID 없음 — 초안 보류")
+    note_path = VAULT_ROOT / note_rel
+
+    # ── 멱등 가드 (2단: frontmatter 마커 → Gmail drafts 조회) ──
+    existing_draft = ""
+    if note_path.exists():
+        try:
+            fm = _parse_frontmatter(note_path.read_text(encoding="utf-8"))
+            existing_draft = (fm.get("gmail_draft_id") or "").strip()
+        except OSError:
+            pass
+    if not existing_draft:
+        # 마커 없음 — 초안 생성 성공 후 마커 기록 전 죽었을 수 있음.
+        # Gmail 에 그 스레드 초안이 이미 있으면 재사용(중복 생성 차단,
+        # 직전 run 의 고아 초안 자동 흡수). 마커도 보강 기록.
+        gid = _find_existing_draft_for_thread(thread_id)
+        if gid:
+            existing_draft = gid
+            _attach_draft_to_note(item, gid)
+    if existing_draft:
+        q = state.setdefault("awaiting_reply", [])
+        if not any(e.get("msg_id") == thread_id for e in q):
+            # state 유실 복구: drafted_at 생략 → _poll 가 drafted_ms=0 으로
+            # 처리(스레드에 SENT 있으면 즉시 promote — 이미 보냈을 수 있음).
+            q.append({
+                "msg_id": thread_id, "drafted_at": "",
+                "draft_id": existing_draft,
+                "subject": item.get("subject", ""),
+                "vault_note_path": note_rel,
+                "src_label": src_label, "terminal": LABEL_DONE_9,
+            })
+        return (True, "")          # 재공지 안 함 (drafted 미누적)
+
+    # ── 신규 초안 (LEGACY cmd_draft_reply 흐름 재사용) ──
+    payload = fetch_thread_full(thread_id, out_dir=None)
+    if payload is None:
+        return (False, "thread fetch 실패")
+    msg = _pick_target_message(payload, thread_id)
+    if not msg:
+        return (False, "타깃 메시지 추출 실패")
+    headers = _headers_to_dict(msg.get("payload", {}).get("headers", []))
+    frm = headers.get("from", "")
+    subject = headers.get("subject", "(제목 없음)")
+    reply_to = headers.get("reply-to", "") or frm
+    body_text = _extract_plain_text(msg.get("payload") or {}) or msg.get("snippet", "")
+    vault_ctx = _search_vault_context(item)
+    prior_threads = _search_prior_threads(item)
+
+    prompt_parts = [
+        "다음 Gmail 메일에 대한 한국어 회신 초안을 작성하라.",
+        "Dr. Ben(benkorea.ai@gmail.com)이 보낼 회신이며, 정중한 존댓말을 쓴다.",
+        "**무인 자동 초안** — Dr. Ben 이 Gmail Drafts 에서 검토 후 직접 발송한다."
+        " 사실관계를 임의 단정하지 말 것.",
+        "",
+        "출력 형식 (엄격):",
+        "- 첫 줄에 정확히 `STATUS: ok` 또는 `STATUS: review` 중 하나.",
+        "  · ok = 회신 의도·필요 정보가 명확, 그대로 보낼 만한 초안.",
+        "  · review = 의도 불분명/가정 과다/Dr. Ben 의 사실 확인 필요."
+        " 이 경우 본문은 단정 대신 정중한 확인·명확화 요청 형태로.",
+        "- 둘째 줄부터 회신 본문만 (인사·서명 가능, 코드블록·메타 설명 금지).",
+        "",
+        f"[원본 메일 from: {frm}]",
+        f"[subject: {subject}]",
+        "",
+        "[원본 본문]",
+        body_text[:4000],
+        "",
+    ]
+    if prior_threads:
+        prompt_parts += ["[같은 발신자의 직전 thread]", prior_threads, ""]
+    if vault_ctx:
+        prompt_parts += ["[vault 관련 노트 발췌 — 톤·맥락 참고]", vault_ctx, ""]
+    prompt = "\n".join(prompt_parts)
+
+    cmd = [
+        "claude", "--print", "--permission-mode", "bypassPermissions",
+        "--model", "claude-opus-4-7",
+        "--disallowedTools",
+        "Bash,Read,Edit,Write,Glob,Grep,Agent,WebFetch,WebSearch",
+    ]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True,
+                           text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return (False, "LLM timeout")
+    if r.returncode != 0:
+        return (False, f"LLM exit={r.returncode}")
+    out = (r.stdout or "").strip()
+    if out.startswith("```"):
+        nl = out.find("\n")
+        out = out[nl + 1:] if nl >= 0 else out[3:]
+        if out.rstrip().endswith("```"):
+            out = out.rstrip()[:-3]
+        out = out.strip()
+    # STATUS 라인 파싱·제거 (이메일 본문엔 절대 안 들어가게)
+    review = True               # 보수적 기본 — STATUS 누락 시 검토 플래그
+    lines = out.split("\n", 1)
+    if lines and lines[0].strip().upper().startswith("STATUS:"):
+        token = lines[0].split(":", 1)[1].strip().lower()
+        review = (token != "ok")
+        out = lines[1].strip() if len(lines) > 1 else ""
+    body = out.strip()
+    if not body:
+        return (False, "LLM 빈 응답")
+
+    re_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    fd_b, body_file = tempfile.mkstemp(prefix=".gws-reply.", suffix=".txt")
+    try:
+        with os.fdopen(fd_b, "w", encoding="utf-8") as f:
+            f.write(body)
+        out_json = gog_json(
+            "gmail", "drafts", "create",
+            "--to", reply_to, "--subject", re_subject,
+            "--body-file", body_file,
+            "--reply-to-message-id", thread_id,
+        )
+    finally:
+        try:
+            os.unlink(body_file)
+        except OSError:
+            pass
+    if out_json is None or out_json == []:
+        return (False, "gog drafts create 실패")
+    draft_id = _draft_id_from_create(out_json)
+    if not draft_id:
+        # 초안이 실제로 생겼을 수도(파싱만 실패) → Gmail 조회로 회수,
+        # 중복 생성 금지. 그래도 없으면 진짜 실패.
+        draft_id = _find_existing_draft_for_thread(thread_id) or ""
+    if not draft_id:
+        return (False, f"drafts create 응답 비정상: {out_json}")
+
+    _attach_draft_to_note(item, draft_id)
+    # reply_review / brainify_origin 마커 (best-effort 2차 atomic write)
+    if note_path.exists():
+        try:
+            t = note_path.read_text(encoding="utf-8")
+            t = _replace_fm_field(t, "reply_review",
+                                  "needed" if review else "pending")
+            t = _replace_fm_field(t, "brainify_origin", "reply-label")
+            fd, tmp = tempfile.mkstemp(prefix=".gws-note.",
+                                       dir=str(note_path.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(t)
+            os.replace(tmp, note_path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except (OSError, NameError):
+                pass
+
+    state.setdefault("awaiting_reply", []).append({
+        "msg_id": thread_id,
+        "drafted_at": now.isoformat(timespec="seconds"),
+        "draft_id": draft_id,
+        "subject": subject,
+        "vault_note_path": note_rel,
+        "src_label": src_label, "terminal": LABEL_DONE_9,
+    })
+    drafted.append(_short_subject(subject, 40)
+                   + (" [검토필요]" if review else ""))
+    return (True, "")
+
+
+def _run_reply_composite_drain(state: dict, now: dt.datetime, *,
+                               label: str, tag: str, pre=None,
+                               dry_run: bool = False,
+                               limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """회신 포함 라벨(`8`·`4`·`5`·`7`) 공용 2단계 비-terminal 러너.
+    pre: 회신 *전* 실행할 비-회신 atomic 합성 (item,now)->(ok,err).
+         실패 시 bail(commit 차단+발화) — 초안·awaiting_reply 생성 *전* 이라
+         고아 초안 없음. None 이면 순수 `8 회신`. reply 는 항상 마지막.
+    commit_fn=`_commit_reply_label`(비-terminal·라벨 유지). 발송감지→
+    `9 완료` promote 는 `_poll_awaiting_replies`(awaiting_reply src_label=
+    label 이라 *그 라벨*을 떼고 `9 완료`). sent-poll 조율: 동반노트
+    `gmail_threadIds` canonical → sent-poll threadId 가드가 이미-노트화 skip.
+    Telegram: silent-on-success 의 §11.5 명문화 예외 — 이번 사이클 *신규*
+    초안만 1건 요약으로 problem 채널에 합성(cmd_poll 이 Telegram 전달)."""
+    drafted: list[str] = []
+
+    def _xa(it, n):
+        if pre is not None:
+            ok, err = pre(it, n)
+            if not ok:
+                return (False, err)
+        return _reply_extra_action(it, n, state, drafted, src_label=label)
+
+    full, problem = _run_label_drain(
+        state, now, label=label, tag=tag,
+        extra_action=_xa, commit_fn=_commit_reply_label,
+        dry_run=dry_run, limit=limit)
+    if drafted and not dry_run:
+        summary = (f"[{tag} → 검토대기] 초안 {len(drafted)}건 — "
+                   f"Gmail Drafts 검토·발송 요망: " + ", ".join(drafted) + "\n")
+        full = (full + summary) if full else summary
+        problem = (problem + summary) if problem else summary
+    return (full, problem)
+
+
+def _run_reply_label_drain(state: dict, now: dt.datetime, *,
+                           dry_run: bool = False,
+                           limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`8 회신` (={회신}) — pre 없는 순수 회신 (§11.5 spec-lock)."""
+    return _run_reply_composite_drain(
+        state, now, label=LABEL_REPLY, tag="8 회신", pre=None,
+        dry_run=dry_run, limit=limit)
+
+
+def _run_sched_reply_drain(state: dict, now: dt.datetime, *,
+                           dry_run: bool = False,
+                           limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`4 일정+회신` (={일정,회신}) — Calendar 이벤트 + 회신 초안 + 2단계.
+    pre=schedule: 일시 추출 실패 시 commit 보류+발화(`2 일정` 계약) — reply
+    생성 전 bail 이라 고아 초안 없음. 재개 시 schedule 만 재시도 후 reply."""
+    return _run_reply_composite_drain(
+        state, now, label=LABEL_SCHED_REPLY, tag="4 일정+회신",
+        pre=lambda it, n: _schedule_extra_action(it, n),
+        dry_run=dry_run, limit=limit)
+
+
+def _run_task_reply_drain(state: dict, now: dt.datetime, *,
+                          dry_run: bool = False,
+                          limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`7 할일+회신` (={할일,회신}) — Google Task + 회신 초안 + 2단계.
+    pre=task(항상 성공·멱등)."""
+    return _run_reply_composite_drain(
+        state, now, label=LABEL_TASK_REPLY, tag="7 할일+회신",
+        pre=lambda it, n: _task_extra_action(it, n, state),
+        dry_run=dry_run, limit=limit)
+
+
+def _run_sched_task_reply_drain(state: dict, now: dt.datetime, *,
+                                dry_run: bool = False,
+                                limit: int = GMAIL_SAVE_MAX) -> tuple[str, str]:
+    """`5 일정+할일+회신` (={일정,할일,회신}) — Task + Calendar + 회신 초안
+    + 2단계. pre=`_sched_task_extra_action`(=`3` 의 task→schedule, bail 포함)
+    그대로 재사용 — 복합의 복합도 순수 조합."""
+    return _run_reply_composite_drain(
+        state, now, label=LABEL_SCHED_TASK_REPLY, tag="5 일정+할일+회신",
+        pre=lambda it, n: _sched_task_extra_action(it, n, state),
+        dry_run=dry_run, limit=limit)
 
 
 def _run_reply_drain(state: dict, now: dt.datetime, *,
@@ -3735,6 +4302,67 @@ def cmd_schedule_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
     return 0
 
 
+def cmd_task_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """`/gws-assistant task-drain [--dry-run] [N]` — `6 할일` 수동 드레인.
+    cron 자동발화와 동일 로직 (Google Tasks + 노트 + 9 완료), 검증·수동용."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    full, _problem = _run_task_drain(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
+def cmd_schedule_task_drain(state: dict, now: dt.datetime,
+                            argv: list[str]) -> int:
+    """`/gws-assistant schedule-task-drain [--dry-run] [N]` — `3 일정+할일`
+    수동 드레인. cron 과 동일 (Tasks + Calendar + 9 완료), 검증·수동용."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    full, _problem = _run_sched_task_drain(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
+def _cmd_simple_drain(state: dict, now: dt.datetime, argv: list[str],
+                      runner) -> int:
+    """수동 드레인 공용 (--dry-run/[N] 파싱 + 출력 + save). 검증·수동용."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    full, _problem = runner(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
+def cmd_sched_reply_drain(state, now, argv):
+    """`schedule-reply-drain` — `4 일정+회신` 수동 드레인."""
+    return _cmd_simple_drain(state, now, argv, _run_sched_reply_drain)
+
+
+def cmd_task_reply_drain(state, now, argv):
+    """`task-reply-drain` — `7 할일+회신` 수동 드레인."""
+    return _cmd_simple_drain(state, now, argv, _run_task_reply_drain)
+
+
+def cmd_sched_task_reply_drain(state, now, argv):
+    """`schedule-task-reply-drain` — `5 일정+할일+회신` 수동 드레인."""
+    return _cmd_simple_drain(state, now, argv, _run_sched_task_reply_drain)
+
+
 def cmd_reply_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
     """`/gws-assistant reply-drain [--dry-run] [N]` — 보낸편지함 회신 브레인화
     수동 트리거. cron 자동발화와 동일 로직, 검증·수동용."""
@@ -3744,6 +4372,22 @@ def cmd_reply_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
         if a.isdigit():
             lim = max(1, int(a))
     full, _problem = _run_reply_drain(state, now, dry_run=dry, limit=lim)
+    if full:
+        print(full, end="" if full.endswith("\n") else "\n")
+    save_state(state)
+    return 0
+
+
+def cmd_reply_label_drain(state: dict, now: dt.datetime, argv: list[str]) -> int:
+    """`/gws-assistant reply-label-drain [--dry-run] [N]` — `8 회신` 수동 드레인.
+    cron 자동발화와 동일 로직 (초안 작성 + awaiting_reply 2단계 + 사이클당
+    1건 요약), 검증·수동용. `reply-drain`(보낸편지함 sent-poll)과 별개."""
+    dry = "--dry-run" in argv
+    lim = GMAIL_SAVE_MAX
+    for a in argv:
+        if a.isdigit():
+            lim = max(1, int(a))
+    full, _problem = _run_reply_label_drain(state, now, dry_run=dry, limit=lim)
     if full:
         print(full, end="" if full.endswith("\n") else "\n")
     save_state(state)
@@ -3766,7 +4410,7 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
     # 아래 튜플에 append (동일 게이트·동일 problem 누적).
     if state.get("autodrain_enabled"):
         _problems: list[str] = []
-        for _handler in (_run_save_drain, _run_schedule_drain, _run_reply_drain):  # 1·2·회신. 추후 3~8.
+        for _handler in (_run_save_drain, _run_schedule_drain, _run_task_drain, _run_sched_task_drain, _run_reply_label_drain, _run_sched_reply_drain, _run_task_reply_drain, _run_sched_task_reply_drain, _run_reply_drain):  # 1·2·6·3·8·4·7·5·sent-poll (전 라벨 + 보낸편지함).
             _full, _problem = _handler(state, now)
             if _problem:
                 _problems.append(_problem)
@@ -4315,8 +4959,20 @@ def main(argv: list[str]) -> int:
             return cmd_save_drain(state, now, argv[1:])
         if first == "schedule-drain":
             return cmd_schedule_drain(state, now, argv[1:])
+        if first == "task-drain":
+            return cmd_task_drain(state, now, argv[1:])
+        if first == "schedule-task-drain":
+            return cmd_schedule_task_drain(state, now, argv[1:])
         if first == "reply-drain":
             return cmd_reply_drain(state, now, argv[1:])
+        if first == "reply-label-drain":
+            return cmd_reply_label_drain(state, now, argv[1:])
+        if first == "schedule-reply-drain":
+            return cmd_sched_reply_drain(state, now, argv[1:])
+        if first == "task-reply-drain":
+            return cmd_task_reply_drain(state, now, argv[1:])
+        if first == "schedule-task-reply-drain":
+            return cmd_sched_task_reply_drain(state, now, argv[1:])
         if first == "--force-poll" or first == "--force-batch":
             return cmd_poll(state, now, force=True)
         # unknown — fall through to poll

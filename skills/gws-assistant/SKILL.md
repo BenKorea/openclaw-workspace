@@ -36,7 +36,9 @@ agent 가 받는 슬래시 명령 → 그대로 `run.py` 의 첫 인자로 forwa
 | `/gws-assistant pending-review [N]` | 보류 라벨 메일 N건 라벨 제거 후 재분류 plan |
 | `/gws-assistant save-drain [--dry-run] [N]` | §11 `1 저장` 라벨 완전무인 드레인 — 노트 생성+PARA 배치+`9 완료` commit. `--dry-run` 은 mutation 없이 계획만 |
 | `/gws-assistant schedule-drain [--dry-run] [N]` | §11.5 `2 일정` 라벨 완전무인 드레인 — 노트 + **Google Calendar 이벤트** + PARA 배치 + `9 완료`. `--dry-run` 은 계획만 |
+| `/gws-assistant task-drain [--dry-run] [N]` | §11.5 `6 할일` 라벨 완전무인 드레인 — 노트 + **Google Tasks 등록**(Brainify 리스트) + PARA 배치 + `9 완료`. 추출 실패해도 제목 fallback 으로 항상 task 1개. `--dry-run` 은 계획만 |
 | `/gws-assistant reply-drain [--dry-run] [N]` | §11.5 **보낸메일 브레인화** — 라벨 0마찰. 보낸편지함 폴링 → **회신+콜드 전부**(KIRAMS 포워딩은 `[KIRAMS-FWD]` + `from:kirams AND [FW]` 로 정밀 제외), audit 가치로만 필터해 노트화. `--dry-run` 은 계획만 |
+| `/gws-assistant reply-label-drain [--dry-run] [N]` | §11.5 `8 회신` 라벨 드레인 — 노트 + **회신 초안**(Opus, Drafts) + `awaiting_reply` 2단계(발송감지→`9 완료` promote) + 사이클당 1건 Telegram 요약. `reply-drain`(sent-poll)과 별개. `--dry-run` 은 계획만 |
 
 ## 출력 처리 규칙
 
@@ -73,14 +75,17 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 - 트리거: cron poll 매 사이클, 게이트 무관 백그라운드. **단일 킬스위치 `state['autodrain_enabled']` (기본 False)** 가 1~8 핸들러 전부 관장 (2026-05-16 Dr. Ben: 라벨별 플래그 아님 — 인지부하 최소·현실 부합). 검증 후 활성화. 수동 서브커맨드(`save-drain [--dry-run]` 등)는 킬스위치 무관 항상 동작.
 - **Telegram 정책 (2026-05-16 Dr. Ben)**: 성공(완료/복구)은 **완전 침묵**. **오류 발생 시에만** 1건 발화. 일일 다이제스트 폐기 — 1~8 잔존은 (2~8 핸들러 완성 후엔) 곧 처리될 in-flight 라 보고가 무의미. `_run_save_drain` 은 `(full, problem)` 반환: 수동 `save-drain` 은 full 전체 출력(터미널), cron 은 problem 만 Telegram.
 - 파이프라인 (크래시-안전): threadId 멱등 가드 → `propose_proceed`(노트 staging) → 첨부 `parse_attachment` (파서 레지스트리, 현재 internal) → frontmatter `para_review:pending`/`parser_id`/`parser_version` 주입 + 본문 `## 첨부 파싱` append → `_relocate_to_para`(첨부+노트 PARA 이동) → **commit point: `1 저장` 제거 + `9 완료` 부착 (strictly 마지막)**.
-- 멱등성: 라벨 변경이 commit point. 그 전 크래시 시 메일이 `1 저장` 잔류 → 다음 사이클이 threadId 가드로 [복구](라벨만)/[재개](staging 재배치+라벨) 분기.
+- 멱등성: 라벨 변경이 commit point. 그 전 크래시 시 메일이 `1 저장` 잔류 → 다음 사이클이 threadId 가드로 [복구](액션 보강 idempotent + 라벨)/[재개](staging 재배치+라벨) 분기. **가드는 액션-인지(2026-05-17)**: relocated 노트 존재 시에도 `extra_action` 호출 — extra_action 자체 멱등(`google_task_id`/`calendar_event_id` 마커 self-skip)이 액션 중복 차단, 가드는 노트 중복만 차단. (구: 노트존재=extra_action완료 가정 → 무액션 캡처 노트에 액션 라벨 시 Task/이벤트 조용히 누락하던 크로스-핸들러 사각지대, `2 일정`·`6 할일` 공통이었음.)
 - PARA 추론 불확실 시 staging 잔류 + `para_review:pending` → 주간 §11.4 PARA 배치감사가 사후 교정 (낙관적 배치).
 - PHI 점검 없음 (2026-05-16): 이 Gmail 계정엔 환자정보 송수신 자체가 없어 미수행. CLAUDE.md 2026-04-24 결정과 일관 — 재도입 금지.
 - **⚠️ wrong-message 버그 수정 (2026-05-16, `78262c7`)**: `gog gmail search` 는 **thread 단위** 반환(메시지 id 없음, `id`=threadId). 구 `_pick_target_message` 가 항상 `msgs[0]`(최古 메시지) 선택 → 멀티-메시지 스레드서 라벨 붙은 메일 아닌 엉뚱한 메일로 노트 생성. 수정: `_pick_target_in_thread(payload,label)`(단일=그메시지, 멀티=labelIds 에 label/SENT 든 최신, 없으면 None→skip) + `propose_proceed(*,target_label=)`; label핸들러→`target_label=label`, reply→`"SENT"`. **검증상태 정정: 1·2·reply 기존 "검증완료" 는 단일-메시지 운 — 멀티-메시지 스레드로 재검증 필수.** legacy(target_label=None) 무변경.
-- 코어 `_run_label_drain` 이 1~8 공용 (label/tag/extra_action 파라미터). `_run_save_drain`(1 저장, extra=없음)·`_run_schedule_drain`(2 일정, extra=Calendar 이벤트)·`_schedule_extra_action`(idempotent — calendar_event_id 있으면 재생성 skip, 크래시-재개 안전).
+- 코어 `_run_label_drain` 이 1~8 공용 (label/tag/extra_action 파라미터). `_run_save_drain`(1 저장, extra=없음)·`_run_schedule_drain`(2 일정, extra=Calendar 이벤트)·`_run_task_drain`(6 할일, extra=Google Tasks)·`_schedule_extra_action`/`_task_extra_action`(idempotent — calendar_event_id / google_task_id 있으면 재생성 skip, 크래시-재개 안전).
 - **`2 일정` 출시 (2026-05-16)**: audit 노트 + Calendar 이벤트(`_extract_schedule_from_email`→`_create_calendar_event`→`_attach_schedule_to_note`) + `9 완료`. 일시 추출 실패 시 commit 안 함 + 오류 발화(수동 처리).
+- **`6 할일` 출시 (2026-05-17)**: audit 노트 + Google Tasks 등록(`_extract_task_from_email`→`create_gtask`/`ensure_gtasks_list` 재사용→`_attach_task_to_note`) + `9 완료`. 멱집합 atomic surface 세 개 중 task surface — 일정(`2`)·회신(무라벨 경로)에 이어 마지막 단위 surface 완성, 복합 라벨 `3·4·5·7` 은 이제 합성만 남음. 일정과 달리 마감일 선택(없어도 등록), 추출 실패해도 제목 fallback 으로 항상 task 1개 → `6 할일` 라벨 자체가 Dr. Ben 의 'task' 결정이므로 commit 막지 않음. `extra_action` 이 `state`(gtasks_list_id 캐시) 필요 → `_run_task_drain` 에서 closure 바인딩((item,now) 콜백 계약 유지). frontmatter `google_task_id`/`google_task_due`(schedule 의 `calendar_event_id` 와 평행 — §10 인터랙티브 `gtask_id`·복수형 `google_task_ids` 와 별개 cron 단발 필드).
 - **보낸메일 브레인화 출시 (2026-05-16, `_run_reply_drain`)**: Dr. Ben 결정 — 회신 시 라벨 안 누름(0마찰) + **방향 무관(회신+콜드 전부)**. `8 회신` 라벨 경로 아닌 **보낸편지함 폴링**. `in:sent -subject:"[KIRAMS-FWD]" -(from:kirams.re.kr subject:"[FW]") -label:"9 완료" newer_than:2d` → 보낸 메일 전부(콜드 포함), audit 가치 판단(노트 LLM 단계)으로만 필터. **KIRAMS 포워딩 노이즈 정밀 배제**: ① `[KIRAMS-FWD]` 제목=항상 노이즈 ② `from:kirams AND [FW]`=prefix 없는 변종. (`-in:inbox` 는 archive 후 진짜 보낸 메일과 구분 불가라 폐기, `from:kirams` 전체 배제는 Dr. Ben 의 KIRAMS 별칭 send-as 진짜 메일까지 막아 불가 — 2026-05-16 2차 dry-run 으로 확정.) 노트는 보낸 메시지(회신이면 원문 인용 포함)로 빌드, frontmatter `gmail_threadIds` 를 canonical threadId 로 덮어써 가드 멱등. **라벨 없는 모델**: 제거할 라벨·`9 완료` 부착 없음, 멱등성=노트존재뿐. v1 한계: 노트 있는 스레드의 추가 메일 미포착(§9.2 thread 진화로 위임), 라벨핸들러 교차중복 드묾(주간 §9.2 감사 포착). `brainify_origin: gmail-sent` 마커.
-- `3~8` **라벨** 핸들러는 deferred — `extra_action` 추가만으로 확장. 단 회신 기능은 위 무라벨 경로가 커버하므로 `8 회신` 라벨 경로는 사실상 우선순위 낮음(Dr. Ben 회신 시 라벨 안 함).
+- **`8 회신` 구현 완료 (2026-05-17 dev)**: sent-poll(보낸 답장 사후) ↔ `8 회신`(답장 위임 능동) = 회신 두 절반, 상보적. `_run_label_drain` 에 `commit_fn` seam(`extra_action` 과 평행) — `8 회신` 만 `_commit_reply_label`(archive-only 비-terminal), 1·2·6 기본 terminal. `_reply_extra_action`=LEGACY `cmd_draft_reply` 무인 재배선(`fetch_thread_full`→Opus 초안→`gog gmail drafts create`→`_attach_draft_to_note`→`awaiting_reply`), 멱등=`gmail_draft_id` frontmatter. 모호=`STATUS: ok|review` 1줄 프로토콜(본문 미포함)→`reply_review`+Telegram `[검토필요]`. 종결=기존 2단계 재사용 — `_poll_awaiting_replies` 라벨-인지화(엔트리 `src_label`/`terminal`→`9 완료`+`8 회신` 제거, LEGACY grandfather). `awaiting_reply` skip 필터로 매-사이클 재처리 차단(state 유실→라벨 잔존→가드 멱등 복구 수렴). Telegram=silent-on-success 명문화 예외·`_run_reply_label_drain` 이 사이클당 1건 요약 problem 합성. sent-poll 조율=동반노트 `gmail_threadIds` canonical → `_run_reply_drain` 가드 자동 skip(추가코드 0). 수동 `reply-label-drain`+cron 튜플 1·2·6·8·sent-poll. **회신 2단계 비-terminal 이 복합 `4·5·7` 에 상속**. py_compile·dev clean exit 통과. 첫 실드레인서 멀티-메시지 대상선택 결함 노출 → `_pick_target_in_thread` ID-인지 버그픽스 동반(`_resolve_label_id` 이름→ID, gog 가 per-message labelIds 를 사용자 라벨 ID 로 반환 — 1·2·6·8 공통 결함이었음). 미배포·행동검증 ID-픽스 후 재드레인 대기. 권위=gmail-capture.md §11.5.
+- **`3 일정+할일` 구현 완료 (2026-05-17 dev)**: 순수 terminal 합성 실증 — `_sched_task_extra_action`=`_task_extra_action`+`_schedule_extra_action` 조합뿐(새 로직 0). task 먼저(항상 성공) → schedule(실패 시 `2 일정` 계약대로 commit 차단+발화, 할일은 선확정). 둘 다 기존 멱등 가드 → 합성 자동 멱등. terminal 기본 commit. `_run_sched_task_drain`+`schedule-task-drain`+cron 튜플 1·2·6·3·8·sent-poll. py_compile·clean exit, 행동검증 gog-auth 대기.
+- **`4·5·7` 구현 완료 (2026-05-17 dev) — 8-라벨 멱집합 전부 완성**: `_run_reply_composite_drain(label,tag,pre)` 일반화(8·4·5·7 단일 경로) — `pre`(비-회신 atomic, 실패=reply 전 bail→고아 0)→`_reply_extra_action(src_label=label)`→`commit_fn=_commit_reply_label`. `_reply_extra_action` 에 `src_label` 파라미터(awaiting_reply 에 복합 라벨 기록→`_poll_awaiting_replies` 가 그 라벨 떼고 `9 완료`). pre: 4=schedule/7=task/5=`_sched_task_extra_action`(3 재사용). 수동 `schedule-reply`/`task-reply`/`schedule-task-reply`-drain + cron 튜플 1·2·6·3·8·4·7·5·sent-poll. py_compile·clean exit, 행동검증 gog-auth 대기.
 
 ### 전환 상태 / 폐기 게이트 (mini-sdd transition contract)
 
@@ -90,7 +95,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 
 | 구분 | 범위 | 운명 |
 |---|---|---|
-| **TARGET** | `_run_label_drain` 코어·`save-drain`/`schedule-drain`/`reply-drain`·`_run_reply_drain`·§11.5 `3~8` 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_action_label`·`LABEL_SAVE`/`LABEL_SCHEDULE`/`LABEL_DONE_9` | 영구 |
+| **TARGET** | `_run_label_drain` 코어(+`commit_fn` seam)·`save`/`schedule`/`task`/`reply`/`reply-label`-drain·`_run_task_drain`/`_run_reply_label_drain`/`_run_reply_drain`·`_reply_extra_action`/`_commit_reply_label`·라벨-인지 `_poll_awaiting_replies`·`_sched_task_extra_action`/`_run_sched_task_drain`·`_label_query`(+라벨 하이픈형)·`_run_reply_composite_drain`+4·5·7 핸들러·`parse_attachment` 레지스트리·threadId 가드·`_commit_action_label`·`LABEL_SAVE`/`SCHEDULE`/`TASK`/`REPLY`/`DONE_9` | 영구 |
 | **SHARED-INFRA** | `propose_proceed`·`_relocate_to_para`·`gog_call/json`·노트/frontmatter/PARA 헬퍼·`fetch_thread_full`·Tasks/Calendar 헬퍼·state | 영구 (레거시 삭제 후 TARGET 전용 잔존) |
 | **LEGACY** (게이트서 일괄 삭제) | 3-라벨 classify→plan→approve 흐름 전체: `cmd_poll` 발화경로·`classify_emails_llm`·`build_plan_items`·`merge_plan`·`approve/confirm/edit/skip/dismiss/cancel`·`reply/reply-task/gtask/schedule/nl`·`correct/reclassify/bulk-reclassify/learn-rules/show-rules`·`awaiting_reply` 큐·gates(`check_gates`·`is_busy_now`·`fetch_today_events`·`is_korean_holiday`)·`snooze`·`LABEL_PROCEED/PENDING/NOISE/DONE` 상수·해당 SKILL.md 행 | 게이트 충족 시 |
 | **ONE-SHOT** | `migrate-inbox`·`migrate-brainify-labels` | 1회 사용 후 즉시 삭제 (게이트 무관) |
@@ -100,7 +105,7 @@ python3 ~/.openclaw/workspace/skills/gws-assistant/run.py --force-poll
 **폐기 게이트 트리거 (AND — 전부 충족 시에만 LEGACY 삭제)**
 
 1. `autodrain_enabled=true` 로 자동드레인(활성 핸들러 전체) prod **무사고 ≥ 4주** (또는 무사고 사이클 ≥ 20) — 단일 플래그라 1~8 통합 검증 시계 1개
-2. §11.5 `3~8` 핸들러 출시·검증 완료 (`2 일정` 2026-05-16 출시 완료; 나머지 회신/할일/복합을 신 모델이 커버 — 선행 안 하면 capability 손실)
+2. §11.5 8-라벨 멱집합 **전부 구현 완료** (`2 일정` 2026-05-16; `6 할일`·`8 회신`·sent-poll·`3 일정+할일`·`4·5·7` 2026-05-17 dev) — 남은 건 **행동검증(gog-auth 런타임)** + 배포 cutover; 코드 구현 갭 없음
 3. Dr. Ben 실제 트리아지가 8-라벨 스와이프로 완전 이행 (구 "AI분류+Telegram approve" 가 더 이상 작업흐름 아님 — 운영 확인)
 4. 신 모델 SKILL.md manual test commands 전부 통과 (회귀 안전망)
 5. (구조 선행조건) `run.py` 관심사별 분해되어 LEGACY 가 **단일 모듈로 격리** → 삭제 = 모듈+dispatch 제거
