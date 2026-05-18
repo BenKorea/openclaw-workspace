@@ -108,6 +108,40 @@ LABEL_SCHED_TASK_REPLY = "5 일정+할일+회신"  # {일정,할일,회신} — 
 LABEL_TASK_REPLY = "7 할일+회신"        # {할일,회신} — 6+8, 2단계 비-terminal (§11.5)
 GMAIL_SAVE_MAX = 8           # 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
 REPLY_SENT_WINDOW_DAYS = 2   # 회신 브레인화: 보낸편지함 스캔 윈도우 (멱등이 중복 차단)
+
+# ── tick당 무거운 처리 전역 예산 (FailoverError 방어, 2026-05-19) ──
+# main 백엔드 = claude-cli → run.py 가 *끝나야* OpenClaw 가 보는 JSONL 이
+# 방출된다 (실행 중엔 Bash 도구 캡처라 0개). run.py 가 600s 넘게 침묵하면
+# OpenClaw watchdog 이 "CLI produced no output for 600s and was terminated"
+# → FailoverError → 폴백 모델 회전. run.py 내부 stdout 하트비트는 이
+# watchdog 까지 전파 안 됨(claude-cli 백엔드 스트림이 감시 대상). 따라서
+# 유일하게 통하는 run.py 층 방어 = run 자체를 600s 한참 아래로 묶기.
+# 신규 1건 ≈ 노트생성(claude --print) 180s (+첨부 N×180s). 9개 드레인
+# 핸들러가 이 예산을 *공유* — GMAIL_SAVE_MAX 는 핸들러별이라 9× 합산
+# 폭주를 못 막는다. 예산 소진 시 잔여 메일은 라벨/노트존재 가드로 살아
+# 다음 30분 tick 이 멱등 재개. 잔여 위험 = 단일 메일 첨부 다수 fan-out
+# (별도 과제). 튜닝값.
+POLL_HEAVY_BUDGET = 3
+# None = 무제한 (수동 서브커맨드·import 기본). cmd_poll(cron 경로)에서만
+# _arm_tick_budget() 으로 유한값 장전 → 수동 드레인·dry-run 동작 불변.
+_TICK_HEAVY_REMAINING = None
+
+
+def _arm_tick_budget() -> None:
+    """cron poll 진입 시 유한 예산 장전. 미호출 = 무제한 (수동 경로)."""
+    global _TICK_HEAVY_REMAINING
+    _TICK_HEAVY_REMAINING = POLL_HEAVY_BUDGET
+
+
+def _tick_budget_left() -> bool:
+    return _TICK_HEAVY_REMAINING is None or _TICK_HEAVY_REMAINING > 0
+
+
+def _spend_tick_budget() -> None:
+    """무거운 메일 1건 처리 소비. 무제한 모드면 무효과."""
+    global _TICK_HEAVY_REMAINING
+    if _TICK_HEAVY_REMAINING is not None:
+        _TICK_HEAVY_REMAINING -= 1
 # 파서 추상화 provenance (§11.3). provider 교체 시 _parser_* 가 자기 id/version 반환.
 PARSER_VERSION = "1"
 
@@ -1705,6 +1739,13 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
         if tid in _awaiting_ids:
             continue
 
+        # ── tick 예산 게이트 (FailoverError 방어) ──
+        # 비-dry 실처리에서 예산 소진 시 이 메일·이하 전부 다음 tick 으로
+        # 이월 (라벨/노트존재 가드가 멱등 보존). 소비는 아래 무거운
+        # 브랜치(staging 재개·신규)에서만 — 값싼 라벨복구는 starve 안 함.
+        if not dry_run and not _tick_budget_left():
+            break
+
         # ── threadId 멱등 가드 ──
         existing, relocated = _existing_note_for_thread(tid)
         if existing is not None and relocated:
@@ -1741,6 +1782,7 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
             if dry_run:
                 planned.append(f"· {short} → [재개] staging 노트 재배치+commit")
                 continue
+            _spend_tick_budget()   # 무거운 재개 1건 소비
             try:
                 fm = _parse_frontmatter(existing.read_text(encoding="utf-8"))
             except OSError:
@@ -1767,6 +1809,7 @@ def _run_label_drain(state: dict, now: dt.datetime, *,
         if dry_run:
             planned.append(f"· {short} → [신규] 노트 생성+배치+commit")
             continue
+        _spend_tick_budget()   # 무거운 신규 1건 소비
 
         # ── 본문 fetch + 노트 생성 + staging write ──
         # target_label=label: gog 검색이 thread 단위라, 스레드 안에서 이
@@ -2304,6 +2347,11 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
         if not tid:
             continue
 
+        # tick 예산 게이트 (FailoverError 방어) — 소진 시 잔여는 다음
+        # tick 멱등 재개 (스레드 노트 존재 가드가 done 마커).
+        if not dry_run and not _tick_budget_left():
+            break
+
         # 멱등: 이 스레드 노트 이미 있으면 skip (라벨 없는 모델의 done 마커)
         existing, _ = _existing_note_for_thread(tid)
         if existing is not None:
@@ -2319,6 +2367,7 @@ def _run_reply_drain(state: dict, now: dt.datetime, *,
         # (이전 버그: msgs[0]=원본 inbound 로 잘못 생성됐었음).
         item: dict = {"msg_id": tid, "from": m.get("from", ""),
                       "subject": subj}
+        _spend_tick_budget()   # 무거운 sent-poll 1건 소비
         ok, err = propose_proceed(item, target_label="SENT")
         if not ok:
             errors.append(f"{short} ({err})")
@@ -2515,6 +2564,7 @@ def cmd_poll(state: dict, now: dt.datetime, force: bool) -> int:
        1. awaiting_reply 발송 감지 → `9 완료` promote (회신 2단계 완결).
        2. autodrain 활성 시 1~8 라벨 + sent-poll 일괄 드레인.
        둘 다 게이트 무관 (백그라운드). force 인자는 호출 계약 유지용(무효과)."""
+    _arm_tick_budget()   # cron poll 만 유한 tick 예산 (FailoverError 방어)
     awaiting_msg = _poll_awaiting_replies(state, now)
 
     # §11 액션-라벨 완전무인 드레인 — 게이트 무관 (백그라운드).
