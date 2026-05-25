@@ -162,8 +162,10 @@ def open_context(pw: Playwright, tenant: TenantConfig, headless: bool) -> Browse
     profile_dir.mkdir(parents=True, exist_ok=True)
     return pw.chromium.launch_persistent_context(
         user_data_dir=str(profile_dir),
-        # 옵션 C 채택 후 Chrome PM 의존 제거 → Playwright bundled Chromium 사용 (channel 미지정).
-        # WSL headless 환경 안정성 보강.
+        # [사이드카] full chromium(channel="chromium") = MailPlug Next.js SPA 렌더용.
+        # Playwright 공식 이미지선 full chromium 정상(내 슬림-오버레이선 SIGTRAP 크래시였음).
+        # 환경변수로 override 가능(WEBMAIL_CHANNEL="" → headless-shell).
+        channel=(os.environ.get("WEBMAIL_CHANNEL", "chromium") or None),
         headless=headless,
         # KIRAMS reactive UI(chip 변환·resource-servers 부트스트랩)의 timing race 방어막.
         # 2026-05-17: 기본 300ms 는 headless·fast 환경서 레이스 재발(에이전트가 KIRAMS
@@ -185,6 +187,15 @@ def is_logged_in(page: Page, tenant: TenantConfig) -> bool:
         page.wait_for_selector(sel["inbox_marker"], timeout=5_000)
         return True
     except PlaywrightTimeoutError:
+        # [사이드카] 빈 받은편지함: 메일 행(marker) 0개라 위 timeout → 로그인은 됐는데
+        # 메일 0건인데도 not-logged-in 으로 오판(false auth_failed → 운영서 에러 알림 노이즈).
+        # 로그인 시 항상 있는 안정 요소("메일이 없습니다" 빈표시 / "메일 쓰기" 작성버튼)로 보강.
+        try:
+            for _t in ("메일이 없습니다", "메일 쓰기"):
+                if page.get_by_text(_t, exact=False).count() > 0:
+                    return True
+        except Exception:
+            pass
         return False
 
 
@@ -202,10 +213,23 @@ def perform_login(page: Page, tenant: TenantConfig) -> bool:
 
     secret = load_secret(tenant)
     try:
+        # [컨테이너] 프로필 prefill 대신 ID 명시 입력 — fresh/headless 프로필엔 "아이디저장" 부재.
+        # ID = otp_account(TOTP 라벨)의 @ 앞부분. 새 자격증명 불요.
+        _login_id = (secret.get("otp_account") or "").split("@")[0].strip()
+        if _login_id:
+            try:
+                # ★ fill() 은 값만 설정 → MailPlug React 가 로그인 버튼 활성화에 쓰는 키입력
+                # 이벤트가 안 떠 #btnlogin 이 disabled 유지(2026-05-25 실측, 수동 타이핑은 정상).
+                # 한 글자씩 타이핑(press_sequentially)으로 교체해 실제 키 이벤트 발생시킴.
+                page.locator("#cid").press_sequentially(_login_id, delay=50, timeout=5_000)
+            except PlaywrightTimeoutError as e:
+                log.error("login_id(#cid) 입력 실패: %s", type(e).__name__)
+        else:
+            log.error("login_id 도출 실패 (otp_account 없음)")
         try:
-            page.fill(sel["login_pw"], secret["login_pw"], timeout=5_000)
+            page.locator(sel["login_pw"]).press_sequentially(secret["login_pw"], delay=50, timeout=5_000)
         except (PlaywrightTimeoutError, KeyError) as e:
-            log.error("login_pw fill 실패: %s", type(e).__name__)
+            log.error("login_pw 입력 실패: %s", type(e).__name__)
             return False
 
         page.click(sel["login_submit"])
@@ -213,7 +237,7 @@ def perform_login(page: Page, tenant: TenantConfig) -> bool:
         try:
             page.wait_for_selector(sel["otp_input"], timeout=10_000)
             code = totp_code_from_secret(secret)
-            page.fill(sel["otp_input"], code)
+            page.locator(sel["otp_input"]).press_sequentially(code, delay=50)
             del code
             if sel.get("otp_submit"):
                 page.click(sel["otp_submit"])
@@ -433,7 +457,10 @@ def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
     outcome = Outcome()
 
     with sync_playwright() as pw:
-        ctx = open_context(pw, tenant, headless=True)
+        # [사이드카] MailPlug SPA 는 headless 면 백지(headless 탐지/렌더 surface 요구) →
+        # WEBMAIL_HEADED=1 + xvfb-run 으로 headed 구동 시 정상 렌더(demo 와 동일 경로).
+        _headed = os.environ.get("WEBMAIL_HEADED", "0") == "1"
+        ctx = open_context(pw, tenant, headless=not _headed)
         page = ctx.new_page()
         page.goto(tenant.entry_url, wait_until="domcontentloaded", timeout=30_000)
 
@@ -448,6 +475,25 @@ def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
         if not is_logged_in(page, tenant):
             if not perform_login(page, tenant):
                 outcome.error = "auth_failed"
+                try:  # [컨테이너 진단용] 실패 시점 페이지 상태 + DOM 덤프
+                    page.screenshot(path="/home/node/.openclaw/wmw-authfail.png", full_page=True)
+                    _html = page.content()
+                    open("/home/node/.openclaw/wmw-inbox-dom.html", "w").write(_html)
+                    _body = page.inner_text("body")
+                    log.info("diag: url=%s title=%r htmllen=%d bodytextlen=%d",
+                             page.url, page.title(), len(_html), len(_body))
+                    log.info("diag bodytext[:1500]: %r", _body[:1500])
+                    for _kw in ["지원하지", "브라우저", "오류", "Error", "error", "alert",
+                                "로딩", "loading", "스크립트", "script", "차단", "이동"]:
+                        if _kw in _html:
+                            log.info("diag kw 발견: %s", _kw)
+                    log.info("diag elems: div=%d script=%d table=%d tr=%d",
+                             len(page.query_selector_all("div")),
+                             len(page.query_selector_all("script")),
+                             len(page.query_selector_all("table")),
+                             len(page.query_selector_all("tr")))
+                except Exception as _e:
+                    log.info("diag 실패: %s", type(_e).__name__)
                 ctx.close()
                 return outcome
 
