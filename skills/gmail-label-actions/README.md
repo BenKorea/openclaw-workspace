@@ -35,8 +35,8 @@ OpenClaw 용 **커스텀 스킬 예제**. Gmail 라벨이 뜻하는 **다음 행
 
 ## 전제
 
-- **OpenClaw 게이트웨이** 가동 중 ([`docs/openclaw-docker-container.md`](../../../../docs/openclaw-docker-container.md)).
-- **gog CLI** 설치 + 본인 Gmail 계정 인증 (Gmail·Calendar·Tasks scope) ([`docs/openclaw-docker-gog.md`](../../../../docs/openclaw-docker-gog.md)). 무인 실행 시 keyring 비번(`GOG_KEYRING_PASSWORD`) 환경 제공 필요.
+- **OpenClaw 게이트웨이** 가동 중 ([`docs/openclaw-docker-install.md`](../../../../docs/openclaw-docker-install.md)).
+- **gog CLI** 설치 + 본인 Gmail 계정 인증 (Gmail·Calendar·Tasks scope) ([`docs/openclaw-docker-add-gog.md`](../../../../docs/openclaw-docker-add-gog.md)). 무인 실행 시 keyring 비번(`GOG_KEYRING_PASSWORD`) 환경 제공 필요.
 - **Claude Code CLI(`claude`)** 설치·인증 — 일시·할일·회신 추출용. 없으면 일정·회신은 skip(라벨 유지), 할일은 제목 fallback 으로만 생성.
 - Python 3.
 
