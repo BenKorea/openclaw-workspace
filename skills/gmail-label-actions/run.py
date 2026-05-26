@@ -63,6 +63,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from email.utils import getaddresses
 
 # ── 설정 ────────────────────────────────────────────────────────────────
 ACCOUNT = os.environ.get("GMAIL_ROUTER_ACCOUNT", "").strip()  # 필수 (기본값 없음)
@@ -178,7 +179,7 @@ def _b64url(data: str) -> str:
 def _headers(payload: dict) -> dict:
     """payload.headers → {from,to,subject,date,reply-to} (소문자 키)."""
     h = {x.get("name", "").lower(): x.get("value", "") for x in payload.get("headers", [])}
-    return {k: h.get(k, "") for k in ("from", "to", "subject", "date", "reply-to")}
+    return {k: h.get(k, "") for k in ("from", "to", "cc", "subject", "date", "reply-to")}
 
 
 def _find_text(payload: dict) -> str:
@@ -194,12 +195,56 @@ def _find_text(payload: dict) -> str:
     return walk(payload, "text/plain") or walk(payload, "text/html") or ""
 
 
+_CONTACT_CACHE: dict = {}        # email(lower) → {"name","contact_id"} | None (런당 캐시)
+
+
+def _resolve_contact(email: str) -> dict | None:
+    """이메일 → Google Contact {name, contact_id(resource)} | None. `gog contacts search` 실측 구조:
+    --results-only 시 flat [{email,name,phone,resource}]. 정확 일치 우선, 없으면 첫 결과, 무결과=None."""
+    key = email.lower()
+    if key in _CONTACT_CACHE:
+        return _CONTACT_CACHE[key]
+    res = gog_json("contacts", "search", email, timeout=20)
+    hit = None
+    if isinstance(res, list) and res:
+        exact = next((c for c in res if (c.get("email", "") or "").lower() == key), None)
+        c = exact or res[0]
+        hit = {"name": c.get("name", ""), "contact_id": c.get("resource")}
+    _CONTACT_CACHE[key] = hit
+    return hit
+
+
+def resolve_participants(thread: dict) -> list[dict]:
+    """스레드 전 메시지 From/To/Cc → 고유 참여자 [{name,email,contact_id}]. 본인(ACCOUNT)·빈값 제외.
+    Google Contacts 로 contact_id 해석(무매칭=null). 결정형·best-effort — 신원 해석만, 판단은 brainify."""
+    pairs: list = []
+    for m in thread.get("messages", []):
+        H = _headers(m.get("payload", {}))
+        for field in ("from", "to", "cc"):
+            pairs.extend(getaddresses([H.get(field, "")]))
+    out, seen = [], set()
+    for disp, email in pairs:
+        e = (email or "").strip().lower()
+        if not e or e == ACCOUNT.lower() or e in seen:
+            continue
+        seen.add(e)
+        c = _resolve_contact(e)
+        out.append({
+            "name": (disp.strip() or (c or {}).get("name", "") or e.split("@")[0]),
+            "email": e,
+            "contact_id": (c or {}).get("contact_id"),
+        })
+    return out
+
+
 def build_thread_md(thread: dict, tid: str) -> str:
-    """스레드 전 메시지 → 마크다운. 프론트매터(멱등성 키) + 헤더 + 본문(시간순)."""
+    """스레드 전 메시지 → 마크다운. 프론트매터(멱등성 키 + participants 신원) + 헤더 + 본문(시간순)."""
     msgs = sorted(thread.get("messages", []), key=lambda m: int(m.get("internalDate", "0") or 0))
     last_ts = max((int(m.get("internalDate", "0") or 0) for m in msgs), default=0)
     last_iso = datetime.datetime.fromtimestamp(last_ts / 1000).strftime("%Y-%m-%d %H:%M") if last_ts else ""
     top = _headers(msgs[-1].get("payload", {})) if msgs else {"from": "", "to": "", "subject": "", "date": ""}
+    parts = resolve_participants(thread)
+    plines = "".join("  - " + json.dumps(p, ensure_ascii=False) + "\n" for p in parts)
     fm = (
         "---\n"
         f"gmail_thread_id: {tid}\n"
@@ -207,7 +252,8 @@ def build_thread_md(thread: dict, tid: str) -> str:
         f"last_internal_date: \"{last_iso}\"\n"
         f"subject: {json.dumps(top['subject'], ensure_ascii=False)}\n"
         f"from: {json.dumps(top['from'], ensure_ascii=False)}\n"
-        "---\n\n"
+        + (f"participants:\n{plines}" if parts else "participants: []\n")
+        + "---\n\n"
     )
     blocks = []
     for m in msgs:
