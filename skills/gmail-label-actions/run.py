@@ -214,9 +214,57 @@ def _resolve_contact(email: str) -> dict | None:
     return hit
 
 
-def resolve_participants(thread: dict) -> list[dict]:
-    """스레드 전 메시지 From/To/Cc → 고유 참여자 [{name,email,contact_id}]. 본인(ACCOUNT)·빈값 제외.
-    Google Contacts 로 contact_id 해석(무매칭=null). 결정형·best-effort — 신원 해석만, 판단은 brainify."""
+# ── 미등록 발신자 자동 Contact 등록 (라벨링이 게이트 — Dr. Ben 이 라벨한 스레드만) ──────
+# 기본 OFF (dormant). GMAIL_ROUTER_AUTOCONTACT=1 일 때만 활성.
+AUTOCONTACT = os.environ.get("GMAIL_ROUTER_AUTOCONTACT", "").lower() in ("1", "true", "yes")
+_ROLE_SKIP = re.compile(r"(no-?reply|do-?not-?reply|mailer-daemon|postmaster|notification|newsletter|bounce|webmaster|info|admin)@", re.I)
+_HONOR = re.compile(r"\s*(의학위원|의학이사|총무이사|위원장|부회장|회장|교수|위원|이사|박사|선생|대표|원장|소장|부장|팀장|대리|과장|차장|국장)?님?\s*$")
+
+
+def _clean_name(raw: str) -> str:
+    """헤더 표시명 → 매칭용 이름. 따옴표·괄호·끝 호칭 제거 ('강준원 의학위원님'→'강준원')."""
+    n = re.sub(r"[\"']", "", raw or "")
+    n = re.sub(r"\s*\([^)]*\)", "", n).strip()
+    prev = None
+    while prev != n and n:
+        prev = n
+        n = _HONOR.sub("", n).strip()
+    return n or re.sub(r"[\"']", "", (raw or "")).strip()
+
+
+def _namesake_conflict(name: str, email: str) -> bool:
+    """같은 이름 Contact 가 있는데 이메일이 다르면 True — 동명이인/기존인물 새이메일 모호 → 보류."""
+    if not name:
+        return False
+    res = gog_json("contacts", "search", name, timeout=20)
+    if not isinstance(res, list):
+        return False
+    el = email.lower()
+    for c in res:
+        if _clean_name(c.get("name", "")) == name and (c.get("email", "") or "").lower() not in ("", el):
+            return True
+    return False
+
+
+def _create_contact(name: str, email: str, dry_run: bool) -> dict | None:
+    """Contact 생성. dry_run 이면 생성 안 하고 의도만. 반환 {contact_id} | None."""
+    if dry_run:
+        return None
+    res = gog_json("contacts", "create", "--given", name, "--email", email, timeout=20, results_only=True)
+    rid = None
+    if isinstance(res, dict):
+        rid = res.get("resource") or res.get("resourceName")
+    elif isinstance(res, list) and res:
+        rid = res[0].get("resource") or res[0].get("resourceName")
+    return {"contact_id": rid} if rid else None
+
+
+def resolve_participants(thread: dict, autocontact: bool | None = None, dry_run: bool = False) -> list[dict]:
+    """스레드 전 메시지 From/To/Cc → 고유 참여자 [{name,email,contact_id,...}]. 본인(ACCOUNT)·빈값 제외.
+    Google Contacts 로 contact_id 해석(무매칭=null). autocontact 시 미등록자 자동 Contact 생성
+    (단 동명이인=보류, 역할/노이즈 주소=skip). 신원 해석만 — 인맥 노트·링크는 brainify."""
+    if autocontact is None:
+        autocontact = AUTOCONTACT
     pairs: list = []
     for m in thread.get("messages", []):
         H = _headers(m.get("payload", {}))
@@ -229,11 +277,27 @@ def resolve_participants(thread: dict) -> list[dict]:
             continue
         seen.add(e)
         c = _resolve_contact(e)
-        out.append({
+        entry = {
             "name": (disp.strip() or (c or {}).get("name", "") or e.split("@")[0]),
             "email": e,
             "contact_id": (c or {}).get("contact_id"),
-        })
+        }
+        if c is None and autocontact:                       # 미등록 → 생성/보류 판단
+            cname = _clean_name(disp) or entry["name"]
+            if _ROLE_SKIP.search(e):
+                entry["autocontact"] = "skip(role/noise)"
+            elif _namesake_conflict(cname, e):
+                entry["autocontact"] = "hold(동명이인)"
+            elif dry_run:
+                entry["autocontact"] = f"would_create({cname})"
+            else:
+                made = _create_contact(cname, e, dry_run)
+                if made and made.get("contact_id"):
+                    entry["contact_id"] = made["contact_id"]
+                    entry["autocontact"] = "created"
+                else:
+                    entry["autocontact"] = "create_failed"
+        out.append(entry)
     return out
 
 
