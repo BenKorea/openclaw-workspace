@@ -330,7 +330,7 @@ def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
     page.wait_for_selector(sel["forward_to_input"], timeout=15_000)
 
     # 제목은 새 빌드에서 비동기로 `[FW]<원제목>` 자동 채움 (compose 진입 직후 ~1s 공백).
-    # 공백 상태에서 prefix 만 넣으면 원제목 유실 → gws-assistant 분류 불가.
+    # 공백 상태에서 prefix 만 넣으면 원제목 유실 → gmail-label-actions 분류 불가.
     # 자동 채움 완료(non-empty)까지 wait 후 prefix prepend.
     subject_input = page.locator(sel["forward_subject_input"])
     try:
@@ -445,7 +445,7 @@ def process_inbox(page: Page, tenant: TenantConfig,
 
 
 def notify_telegram(text: str) -> None:
-    """KIRAMS forwarding 알림은 gws-assistant 의 Gmail 브리핑에 흡수되므로 별도 Telegram 발송 ✗.
+    """KIRAMS forwarding 알림은 gmail-label-actions 의 Gmail 브리핑에 흡수되므로 별도 Telegram 발송 ✗.
 
     debugging 용으로 stderr 에만 흘려둠 (OpenClaw 의 stdout-Telegram hook 회피).
     """

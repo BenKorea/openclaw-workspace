@@ -18,7 +18,7 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
 
 ## §Spec — 무엇을 만드는가
 
-**Goal**: KIRAMS (한국원자력의학원) MailPlug webmail 의 신규 메일을 polling 하여 본인 Gmail (`kimbi.kirams@gmail.com`) 로 forwarding. 발송 채널은 **KIRAMS webmail UI 의 "전달" 버튼 click-driven** (외부 SMTP/API ✗). 분류·답장·vault 기록은 `gws-assistant` 가 이어받음.
+**Goal**: KIRAMS (한국원자력의학원) MailPlug webmail 의 신규 메일을 polling 하여 본인 Gmail (`kimbi.kirams@gmail.com`) 로 forwarding. 발송 채널은 **KIRAMS webmail UI 의 "전달" 버튼 click-driven** (외부 SMTP/API ✗). 분류·답장·vault 기록은 `gmail-label-actions` 가 이어받음.
 
 **Why**: KIRAMS 가 IMAP·자동 forwarding 규칙(필터)을 정책으로 차단. 사람이 손으로 "전달" 클릭하는 것은 정상 허용 → browser automation 으로 그 행위 자체를 자동화. society-watch 가 학회 사이트의 "다운로드" 버튼을 클릭하는 것과 동일한 패턴.
 
@@ -26,12 +26,12 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
 1. 30분 cadence cron 으로 무인 동작
 2. TOTP 자동 입력으로 세션 만료 시 자동 재로그인 (사람 개입 없음)
 3. 신규 메일이 KIRAMS UI "전달" click sequence 로 `kimbi.kirams@gmail.com` 받은편지함에 첨부 보존된 채 도달
-4. 발신자 도메인 (`@kirams.re.kr`) + Subject prefix `[KIRAMS-FWD]` 로 gws-assistant 가 KIRAMS 출처 인식 가능
+4. 발신자 도메인 (`@kirams.re.kr`) + Subject prefix `[KIRAMS-FWD]` 로 gmail-label-actions 가 KIRAMS 출처 인식 가능
 5. 자격증명 (webmail ID/PW, TOTP secret) 어느 것도 모델 컨텍스트·log·stdout 에 노출되지 않음
 
 **Out of scope**:
-- 답장 (gws-assistant 의 Drafts 워크플로우가 담당, 발송은 본인 Gmail 에서)
-- vault 기록 (gws-assistant 후속)
+- 답장 (gmail-label-actions 의 Drafts 워크플로우가 담당, 발송은 본인 Gmail 에서)
+- vault 기록 (gmail-label-actions 후속)
 - 다중 tenant 동시 운영 (Phase 1 은 KIRAMS 단일)
 - KIRAMS 보낸편지함 정리 (운영 후 부담되면 별도 phase 로)
 
@@ -41,7 +41,7 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
 
 | 결정 | 내용 |
 |---|---|
-| Architecture | webmail-watch (KIRAMS UI click-driven re-forward) → gws-assistant (분류·답장·vault) |
+| Architecture | webmail-watch (KIRAMS UI click-driven re-forward) → gmail-label-actions (분류·답장·vault) |
 | Browser | Playwright Chromium + skill 전용 `userDataDir` (`~/.openclaw/skills/webmail-watch/chrome-profile/<tenant>/`). OpenClaw 메인 프로필과 분리 |
 | 자격증명 (통합) | `~/.openclaw/secrets/webmail-watch-<tenant>.toml` (chmod 600) `[<TENANT>]` 섹션에 `login_pw` / `otp_secret` / `otp_digits` / `otp_period` 평문. KeePassXC export 형식과 호환되도록 `otp_issuer` / `otp_account` / `otp_type` 메타 키도 무해하게 허용. run.py 가 PW 만 `page.fill` → 로그인 버튼 → OTP 화면. **ID 는 KIRAMS "아이디저장" 기능 prefill 신뢰** (별도 입력 ✗). **2026-05-10 옵션 C 채택** — Chrome autofill 의존 제거, headless 결정성 확보 |
 | 발송 채널 | **KIRAMS UI 의 "전달" 버튼 click sequence** (Playwright). 메시지 열기 → 전달 클릭 → 받는사람 입력 → 제목 prefix 추가 → 전송 클릭. 첨부는 KIRAMS UI 가 자동 포함 |
@@ -51,7 +51,7 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
 | 매 회차 | 받은편지함 위에서부터 `poll_limit=3` 건 처리. **각 회: forward → Gmail 폴더로 이동 → listing 에서 사라짐.** 받은편지함이 비면 break |
 | Idempotency | **받은편지함 = pending queue** 모델 (Dr. Ben 결정 2026-05-10). `last_message_id` 폐기. 옵션 1 (dup 허용) — forward 성공 + 이동 실패 시 break, 다음 회차 재시도 시 dup 1건 (kimbi.kirams Gmail) 가능. KIRAMS 트래픽 작아 무해 가정 |
 | Cadence | `*/30 * * * *` (Asia/Seoul) — OpenClaw cron job `webmail-watch-kirams` |
-| Telegram | 침묵 (`delivery.mode="none"` + `notify_telegram` no-op). gws-assistant 가 분류 시점에 KIRAMS 인식 → 그쪽에서 보고 |
+| Telegram | 침묵 (`delivery.mode="none"` + `notify_telegram` no-op). gmail-label-actions 가 분류 시점에 KIRAMS 인식 → 그쪽에서 보고 |
 | 코드 위치 | `skills/webmail-watch/{SKILL.md, run.py, requirements.txt, PROGRESS.md}` |
 
 ---
@@ -175,9 +175,9 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
   - **Depends on**: P6.1
   - **Done when**: 원본과 첨부 binary diff 0
 
-- [ ] **P6.3 gws-assistant 출처 인식**
-  - **What**: gws-assistant 가 발신자 도메인 + Subject prefix 로 KIRAMS 출처 인식하도록 룰 확장 (필요 시)
-  - **Owner**: model + Dr. Ben (gws-assistant 수정 승인)
+- [ ] **P6.3 gmail-label-actions 출처 인식**
+  - **What**: gmail-label-actions 가 발신자 도메인 + Subject prefix 로 KIRAMS 출처 인식하도록 룰 확장 (필요 시)
+  - **Owner**: model + Dr. Ben (gmail-label-actions 수정 승인)
   - **Depends on**: P6.1
   - **Done when**: KIRAMS-FWD 메일이 분류 단계에서 `kirams` 출처 태그 부여
 
@@ -193,9 +193,9 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
   - **Done when**: 실패 후 재시도 시 누락된 메시지가 다시 forwarding 됨
 
 - [x] **P7.3 Telegram 알림 채널 연결** *(2026-05-10 통과)*
-  - **확정**: OpenClaw 가 cron 실행의 **stdout 을 자동 캡처해 Telegram 발송** (gws-assistant 와 동일 패턴). 비어있으면 침묵.
+  - **확정**: OpenClaw 가 cron 실행의 **stdout 을 자동 캡처해 Telegram 발송** (gmail-label-actions 와 동일 패턴). 비어있으면 침묵.
   - **변경**: `notify_telegram()` 을 `print(text)` 로 정정 — `[telegram]` prefix 제거, stderr → stdout 전환.
-  - **검증**: 실제 Telegram 도착은 P8.1 cron 등록 후 신규 메일 발생 시 자연 검증 (코드 패턴은 동일 hook 검증된 gws-assistant 와 일치).
+  - **검증**: 실제 Telegram 도착은 P8.1 cron 등록 후 신규 메일 발생 시 자연 검증 (코드 패턴은 동일 hook 검증된 gmail-label-actions 와 일치).
   - **외부 의존성 ✗**: bot_token / chat_id 는 OpenClaw 내부 처리, skill 코드 미노출.
 
 ### Phase 8 — 운영
@@ -204,7 +204,7 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
   - **메커니즘**: `mcp__openclaw__cron` action=add. payload `agentTurn` + message `/webmail-watch kirams` → isolated session 이 SKILL 의 §의존성 §호출 형식 따라 `uv run --project ... run.py kirams` 실행.
   - **job id**: `7f87feac-5c20-4675-98c2-948330d4e708`
   - **schedule**: `*/30 * * * *` Asia/Seoul
-  - **delivery**: `mode="none"` (Telegram 침묵 — gws-assistant 브리핑에 흡수)
+  - **delivery**: `mode="none"` (Telegram 침묵 — gmail-label-actions 브리핑에 흡수)
   - **Done when**: 첫 자동 회차 (21:30 KST) 완료 후 webmail-watch.json 의 last_checked 갱신 확인
 
 - [ ] **P8.2 1주일 운영 모니터링**
@@ -242,7 +242,7 @@ Dr. Ben 이 "kirams webmail 재개" 또는 비슷한 지시를 주면, 모델은
 - [ ] 신규 N≥1 회차에서 Telegram 알림 도달
 - [ ] kimbi.kirams 받은편지함에 메시지 도달 + Subject prefix 정상 + 발신자 `@kirams.re.kr`
 - [ ] 원본 첨부 보존 (binary diff 0) — KIRAMS UI 자동 포함 검증
-- [ ] gws-assistant 분류 결과에 KIRAMS 출처 태그 부여
+- [ ] gmail-label-actions 분류 결과에 KIRAMS 출처 태그 부여
 - [ ] 모델 컨텍스트·log 어디에도 평문 자격증명 미노출
 - [ ] webmail-watch.json atomic write (corruption 시 fallback 동작)
 - [ ] 세션 만료 시 자동 재로그인 (1회 의도적 만료 시뮬레이션)
