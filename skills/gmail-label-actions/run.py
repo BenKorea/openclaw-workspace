@@ -67,6 +67,10 @@ from email.utils import getaddresses
 
 # ── 설정 ────────────────────────────────────────────────────────────────
 ACCOUNT = os.environ.get("GMAIL_ROUTER_ACCOUNT", "").strip()  # 필수 (기본값 없음)
+# 본인 주소 집합 — 포워드 분류·참여자 self-제외용. ACCOUNT(Gmail) 외 다른 본인 주소(KIRAMS 등)는
+# GMAIL_SELF_ADDRESSES 에 쉼표로 추가(예: "kimbi@kirams.re.kr,benkorea.ai@gmail.com"). 미설정 시 ACCOUNT 만.
+# 머신 무관(스킬은 공유) — 본인 주소는 env 로 주입, 하드코딩 금지.
+SELF = {ACCOUNT.lower()} | {a.strip().lower() for a in os.environ.get("GMAIL_SELF_ADDRESSES", "").split(",") if a.strip()}
 INBOX = pathlib.Path(os.path.expanduser(
     os.environ.get("GMAIL_ROUTER_INBOX", "~/.openclaw/workspace/attachments")))
 DONE_LABEL = "9 완료"          # 터미널 표식 (고정 규칙)
@@ -259,6 +263,31 @@ def _create_contact(name: str, email: str, dry_run: bool) -> dict | None:
     return {"contact_id": rid} if rid else None
 
 
+_FORWARD_MARKERS = re.compile(
+    r"-{3,}\s*Original Message\s*-{3,}"   # MailPlug/Outlook 스타일 (KIRAMS 웹메일)
+    r"|-{2,}\s*Forwarded message"          # Gmail 포워드
+    r"|---------- Forwarded"
+    r"|전달된\s*메시지",                     # 한글
+    re.I)
+
+
+def _classify_mail(thread: dict) -> str:
+    """메일 3-클래스 — 포워드는 봉투 From/To/Cc 가 실제 상대가 아니라(본문 인용 헤더에 진짜 인물) 정책이 다름.
+      native        : 포워드 아님 → 봉투 = 실제 인맥 (현행).
+      self-forward  : 내가 포워드(봉투 From ∈ SELF + 포워드마커) → 봉투=나(제외), 실제 상대는 본문에.
+      other-forward : 남이 나에게 포워드+코멘트(포워드마커, From ∉ SELF) → 봉투=전달자(1순위 인맥), 인용 인물은 참조.
+    분류는 결정형(self-addr 체크 + 본문 포워드마커 스캔). 본문 인물 추출은 brainify(LLM)."""
+    msgs = thread.get("messages", [])
+    if not msgs:
+        return "native"
+    H = _headers(msgs[-1].get("payload", {}))
+    from_addrs = [(e or "").lower() for _, e in getaddresses([H.get("from", "")]) if e]
+    body = "\n".join((_find_text(m.get("payload", {})) or m.get("snippet", "")) for m in msgs)
+    if not _FORWARD_MARKERS.search(body):
+        return "native"
+    return "self-forward" if any(e in SELF for e in from_addrs) else "other-forward"
+
+
 def resolve_participants(thread: dict, autocontact: bool | None = None, dry_run: bool = False) -> list[dict]:
     """스레드 전 메시지 From/To/Cc → 고유 참여자 [{name,email,contact_id,...}]. 본인(ACCOUNT)·빈값 제외.
     Google Contacts 로 contact_id 해석(무매칭=null). autocontact 시 미등록자 자동 Contact 생성
@@ -273,7 +302,7 @@ def resolve_participants(thread: dict, autocontact: bool | None = None, dry_run:
     out, seen = [], set()
     for disp, email in pairs:
         e = (email or "").strip().lower()
-        if not e or e == ACCOUNT.lower() or e in seen:
+        if not e or e in SELF or e in seen:
             continue
         seen.add(e)
         c = _resolve_contact(e)
@@ -308,12 +337,19 @@ def build_thread_md(thread: dict, tid: str) -> str:
     last_iso = datetime.datetime.fromtimestamp(last_ts / 1000).strftime("%Y-%m-%d %H:%M") if last_ts else ""
     top = _headers(msgs[-1].get("payload", {})) if msgs else {"from": "", "to": "", "subject": "", "date": ""}
     parts = resolve_participants(thread)
+    cls = _classify_mail(thread)
+    _PNOTE = {
+        "self-forward": "포워드(내 전달) — 봉투 참여자=나라 제외됨. 실제 상대는 본문 인용 헤더에 있음 → brainify(LLM) 추출.",
+        "other-forward": "포워드+코멘트(타인 전달) — 봉투=전달자(1순위 인맥). 인용 속 인물은 'via 전달자' 참조만(autocontact ✗) → brainify 처리.",
+    }
     plines = "".join("  - " + json.dumps(p, ensure_ascii=False) + "\n" for p in parts)
     fm = (
         "---\n"
         f"gmail_thread_id: {tid}\n"
         f"message_count: {len(msgs)}\n"
-        f"last_internal_date: \"{last_iso}\"\n"
+        f"mail_class: {cls}\n"
+        + (f"participants_note: {json.dumps(_PNOTE[cls], ensure_ascii=False)}\n" if cls in _PNOTE else "")
+        + f"last_internal_date: \"{last_iso}\"\n"
         f"subject: {json.dumps(top['subject'], ensure_ascii=False)}\n"
         f"from: {json.dumps(top['from'], ensure_ascii=False)}\n"
         + (f"participants:\n{plines}" if parts else "participants: []\n")
