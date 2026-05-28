@@ -2,6 +2,10 @@
 .openclaw/*
 !.openclaw/workspace-state.json
 state/
+.openclaw-cli-images/
+
+# Gmail/외부 첨부 캐시 — vault sources/ 로 흐르는 staging, repo 동기 비대상
+attachments/
 
 # Python bytecode + venv
 __pycache__/
