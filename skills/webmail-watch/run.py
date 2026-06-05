@@ -160,25 +160,24 @@ def totp_code(tenant: TenantConfig) -> str:
 def open_context(pw: Playwright, tenant: TenantConfig, headless: bool) -> BrowserContext:
     profile_dir = PROFILE_ROOT / tenant.key
     profile_dir.mkdir(parents=True, exist_ok=True)
-    return pw.chromium.launch_persistent_context(
+    _kwargs = dict(
         user_data_dir=str(profile_dir),
-        # [사이드카] full chromium(channel="chromium") = MailPlug Next.js SPA 렌더용.
-        # Playwright 공식 이미지선 full chromium 정상(내 슬림-오버레이선 SIGTRAP 크래시였음).
-        # 환경변수로 override 가능(WEBMAIL_CHANNEL="" → headless-shell).
+        # [사이드카] full chromium = MailPlug Next.js SPA 렌더용 (env WEBMAIL_CHANNEL override).
         channel=(os.environ.get("WEBMAIL_CHANNEL", "chromium") or None),
         headless=headless,
-        # KIRAMS reactive UI(chip 변환·resource-servers 부트스트랩)의 timing race 방어막.
-        # 2026-05-17: 기본 300ms 는 headless·fast 환경서 레이스 재발(에이전트가 KIRAMS
-        # 502 외부장애로 오진한 건이 실제론 이 레이스였음 — demo(slow_mo=800)는 정상
-        # forwarding). demo-검증값 800 으로 상향해 재발 종결. 백그라운드 폴러라
-        # action 당 +Δ 운영 무의미(사람 비대기·시간당 1회). headed/trace/walkthrough 가
-        # demo-전용 과함이고 그건 cron 에 애초 없음 — slow_mo 는 정당한 안전값.
-        # env 로 override 가능(디버깅 0, 추후 측정 기반 하향 시).
+        # KIRAMS reactive UI timing race 방어막 (demo-검증값 800ms, env WEBMAIL_SLOW_MO override).
         slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "800")),
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
+    # 데모 녹화 — WEBMAIL_RECORD_DIR 설정 시 세션 전체를 webm 영상으로 저장(context close 시 확정).
+    _rec = os.environ.get("WEBMAIL_RECORD_DIR", "").strip()
+    if _rec:
+        os.makedirs(_rec, exist_ok=True)
+        _kwargs["record_video_dir"] = _rec
+        _kwargs["record_video_size"] = {"width": 1280, "height": 900}
+    return pw.chromium.launch_persistent_context(**_kwargs)
 
 
 def is_logged_in(page: Page, tenant: TenantConfig) -> bool:
@@ -248,7 +247,9 @@ def perform_login(page: Page, tenant: TenantConfig) -> bool:
             # MailPlug 새 빌드: OTP 후 /mail 로 redirect 하지만 inbox 테이블이
             # 자동 렌더링 ✗ → inbox_url 명시 이동 후 marker 확인.
             try:
-                page.wait_for_url("**/mail**", timeout=15_000)
+                # 낙관적 대기 — redirect 가 패턴과 맞으면 즉시 통과, 아니면 짧게만 기다리고
+                # 아래 goto(inbox_url) + inbox_marker 대기가 실제 안전망. (15s→4s: OTP 후 dead-wait 단축)
+                page.wait_for_url("**/mail**", timeout=4_000)
             except PlaywrightTimeoutError:
                 pass
             page.goto(tenant.inbox_url, wait_until="domcontentloaded", timeout=30_000)
@@ -540,7 +541,13 @@ def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
             ctx.close()
             return outcome
 
+        _video = page.video if os.environ.get("WEBMAIL_RECORD_DIR", "").strip() else None
         ctx.close()
+        if _video is not None:
+            try:
+                log.info("📹 demo 영상 저장: %s", _video.path())
+            except Exception as _e:
+                log.info("영상 경로 조회 실패: %s", type(_e).__name__)
 
     state.setdefault(tenant.key, {})
     state[tenant.key].pop("last_message_id", None)
