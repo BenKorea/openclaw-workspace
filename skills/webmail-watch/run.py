@@ -311,7 +311,11 @@ def _wait_toolbar_enabled(page: Page, label: str, timeout: int = 8_000) -> None:
     )
 
 
-def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
+class OversizeForwardError(Exception):
+    """forward 대상 메일이 MailPlug 20MB 한도 초과 — compose 가 안 열리고 차단 모달이 뜸."""
+
+
+def forward_via_webmail(page: Page, tenant: TenantConfig, row_idx: int = 0) -> None:
     """받은편지함 listing 상태에서 호출 (MailPlug 새 빌드 모델).
 
     행 체크박스 선택 → toolbar "전달" → /mail/write compose → 발송 → 받은편지함 복귀.
@@ -323,10 +327,30 @@ def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
     _wait_for_ui_idle(page)
 
     # 첫 row 체크박스 선택 → toolbar 활성화
-    page.locator(sel["row_checkbox"]).first.click(timeout=10_000)
+    page.locator(f'label[for="toggle-{row_idx}"]').first.click(timeout=10_000)
     _wait_toolbar_enabled(page, "전달")
 
     page.locator(sel["forward_button"]).first.click(timeout=10_000)
+    # "전달" 후 둘 중 하나: compose 수신자칸(정상) 또는 "최대 20MB" 차단 모달(용량초과).
+    # 1초 간격 폴로 먼저 나타나는 쪽 감지 — 정상·초과 둘 다 빠르게 판정(15초 낭비 회피).
+    oversize = False
+    for _ in range(16):
+        if page.locator(sel["forward_to_input"]).count() > 0:
+            break
+        if page.locator('text=최대 20MB').count() > 0:
+            oversize = True
+            break
+        page.wait_for_timeout(1000)
+    if oversize:
+        # 모달 확인 버튼은 정확 텍스트 "확인" — has-text 면 툴바 "수신 확인" 을 오매치하므로 role+exact.
+        page.get_by_role("button", name="확인", exact=True).first.click(timeout=5_000)
+        page.wait_for_selector('text=최대 20MB', state="detached", timeout=5_000)
+        # 선택 해제 — 다음 행 처리 시 다중선택 방지(이 행 체크박스는 아직 켜진 상태).
+        try:
+            page.locator(f'label[for="toggle-{row_idx}"]').first.click(timeout=5_000)
+        except Exception:
+            pass
+        raise OversizeForwardError()
     page.wait_for_selector(sel["forward_to_input"], timeout=15_000)
 
     # 제목은 새 빌드에서 비동기로 `[FW]<원제목>` 자동 채움 (compose 진입 직후 ~1s 공백).
@@ -364,7 +388,7 @@ def forward_via_webmail(page: Page, tenant: TenantConfig) -> None:
         page.wait_for_selector(sel["inbox_marker"], timeout=15_000)
 
 
-def move_to_gmail_folder(page: Page, tenant: TenantConfig) -> None:
+def move_to_gmail_folder(page: Page, tenant: TenantConfig, row_idx: int = 0) -> None:
     """받은편지함 listing 의 첫 row 를 Gmail 폴더로 이동.
 
     forward_via_webmail 호출 후 받은편지함 복귀 상태에서 caller 가 호출.
@@ -374,7 +398,7 @@ def move_to_gmail_folder(page: Page, tenant: TenantConfig) -> None:
 
     # 첫 row 체크박스 click → 선택 → toolbar 활성화
     _wait_for_ui_idle(page)
-    page.locator(sel["row_checkbox"]).first.click(timeout=10_000)
+    page.locator(f'label[for="toggle-{row_idx}"]').first.click(timeout=10_000)
     _wait_toolbar_enabled(page, "이동")
 
     page.locator(sel["toolbar_move_button"]).first.click(timeout=10_000)
@@ -404,10 +428,14 @@ def process_inbox(page: Page, tenant: TenantConfig,
     failures: list[dict[str, Any]] = []
 
     _n = limit if limit is not None else tenant.poll_limit
-    for _ in range(_n):
+    skip = 0          # 선두에 쌓인 forward-불가(용량초과 등) 메일 수 — 그만큼 아래 행을 처리
+    processed = 0
+    guard = 0         # 무한루프 방지 (오버사이즈 다수 대비 여유)
+    while processed < _n and guard < _n + 30:
+        guard += 1
         _ensure_inbox(page, tenant)
 
-        rows = page.locator('tbody tr[data-index="0"]')
+        rows = page.locator(f'tbody tr[data-index="{skip}"]')
         if rows.count() == 0:
             break
         row = rows.first
@@ -426,20 +454,27 @@ def process_inbox(page: Page, tenant: TenantConfig,
         mid = "?"
 
         try:
-            forward_via_webmail(page, tenant)
+            forward_via_webmail(page, tenant, row_idx=skip)
+        except OversizeForwardError:
+            # MailPlug 20MB 한도 초과 — 자동 전달 불가. 받은편지함에 남겨(가시) 다음 행으로.
+            log.warning("oversize >20MB — skip & leave in inbox: %s", subject_text or "?")
+            failures.append({"id": mid, "subject": subject_text, "error": "oversize>20MB"})
+            skip += 1
+            continue
         except Exception as e:
             log.exception("forward 실패: mid=%s", mid)
             failures.append({"id": mid, "subject": subject_text, "error": f"forward:{type(e).__name__}"})
             break
 
         try:
-            move_to_gmail_folder(page, tenant)
+            move_to_gmail_folder(page, tenant, row_idx=skip)
         except Exception as e:
             log.exception("move 실패: mid=%s", mid)
             failures.append({"id": mid, "subject": subject_text, "error": f"move:{type(e).__name__}"})
             break
 
         forwarded.append({"id": mid, "from": from_text, "subject": subject_text})
+        processed += 1
 
     return forwarded, failures
 
