@@ -504,9 +504,51 @@ def _write_action(folder: pathlib.Path, key: str, value: str) -> None:
     (folder / "_actions.json").write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ── 잡첨부 필터 (inline 이미지·TNEF 봉투 제거 — 2026-06-07) ────────────────────
+# 캡처는 첨부를 무차별 저장했으나, 서명 로고 등 inline 이미지와 Outlook TNEF 봉투
+# (winmail.dat — 내부 PDF 가 별도 추출되면 중복)는 지식 가치 0 노이즈. 거른다.
+_INLINE_NAME_RE = re.compile(r"(?i)^image\d+\.(png|gif|jpe?g|bmp)$")
+_TNEF_MAGIC = b"\x78\x9f\x3e\x22"
+
+
+def _attachment_meta(thread: dict) -> tuple[set, set]:
+    """thread payload parts 재귀 순회 → (inline_image_filenames, tnef_filenames).
+    inline = image/* + (Content-Disposition: inline 또는 Content-ID 존재).
+    tnef   = application/ms-tnef 또는 winmail.dat."""
+    inline: set = set()
+    tnef: set = set()
+
+    def walk(p: dict):
+        mime = (p.get("mimeType") or "").lower()
+        fn = p.get("filename") or ""
+        hdrs = {x.get("name", "").lower(): x.get("value", "") for x in p.get("headers", [])}
+        disp = hdrs.get("content-disposition", "").lower()
+        cid = hdrs.get("content-id") or hdrs.get("x-attachment-id")
+        if fn:
+            if mime.startswith("image/") and ("inline" in disp or cid):
+                inline.add(fn)
+            if mime == "application/ms-tnef" or fn.lower() == "winmail.dat":
+                tnef.add(fn)
+        for c in p.get("parts", []) or []:
+            walk(c)
+
+    for m in thread.get("messages", []):
+        walk(m.get("payload", {}))
+    return inline, tnef
+
+
+def _is_tnef_file(path: pathlib.Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(4) == _TNEF_MAGIC
+    except Exception:
+        return False
+
+
 def process_thread(tid: str) -> tuple[bool, str, list[str], pathlib.Path | None, dict]:
-    """스레드를 INBOX 폴더에 캡처: _thread.md(본문) + 첨부 원본.
+    """스레드를 INBOX 폴더에 캡처: _thread.md(본문) + 첨부 원본(잡첨부 제외).
     멱등(threadId+message_count): 동일=재기록 skip / 변동=폴더 덮어쓰기 / 없음=신규.
+    잡첨부 필터: inline 이미지=완전 삭제, TNEF 봉투=내부 실첨부 추출됐을 때만 삭제.
     반환 (ok, msg, 저장목록, 폴더, thread). thread 는 액션 추출에 재사용."""
     staging = STAGING / tid
     staging.mkdir(parents=True, exist_ok=True)
@@ -534,12 +576,31 @@ def process_thread(tid: str) -> tuple[bool, str, list[str], pathlib.Path | None,
     saved: list[str] = []
     (dest_dir / "_thread.md").write_text(build_thread_md(thread, tid), encoding="utf-8")
     saved.append("_thread.md")
-    for src, name in extract_attachments(result, staging):
-        if src.exists():
-            dst = unique_dest(dest_dir / name)
-            shutil.copy2(src, dst)
-            saved.append(dst.name)
-    return (True, "갱신(덮어쓰기)" if existing is not None else "ok", saved, dest_dir, thread)
+
+    inline_names, tnef_names = _attachment_meta(thread)
+    cand = [(src, name) for src, name in extract_attachments(result, staging) if src.exists()]
+
+    def _is_inline(name: str) -> bool:
+        return name in inline_names or bool(_INLINE_NAME_RE.match(name))
+
+    def _is_tnef(src: pathlib.Path, name: str) -> bool:
+        return name in tnef_names or name.lower() == "winmail.dat" or _is_tnef_file(src)
+
+    # 실첨부(=inline·tnef 아닌 것)가 하나라도 있으면 TNEF 봉투는 중복이므로 삭제 가능
+    has_real = any(not _is_inline(n) and not _is_tnef(s, n) for s, n in cand)
+    dropped: list[str] = []
+    for src, name in cand:
+        if _is_inline(name):                       # inline 이미지 = 완전 삭제
+            dropped.append(name); continue
+        if _is_tnef(src, name) and has_real:        # TNEF 봉투 = 내부 추출됐을 때만 삭제
+            dropped.append(name); continue
+        dst = unique_dest(dest_dir / name)
+        shutil.copy2(src, dst)
+        saved.append(dst.name)
+
+    base = "갱신(덮어쓰기)" if existing is not None else "ok"
+    msg = base + (f" · 잡첨부 {len(dropped)}건 제거" if dropped else "")
+    return (True, msg, saved, dest_dir, thread)
 
 
 # ── 추출 (claude --print) ───────────────────────────────────────────────────
