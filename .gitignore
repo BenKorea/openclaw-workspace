@@ -28,3 +28,4 @@ client_secret*.json
 # 안전망: skill에서 _attachments 등 임시 디렉토리 생성 시
 **/_attachments/
 **/_tmp/
+ask-brain-queue/
