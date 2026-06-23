@@ -99,6 +99,8 @@ class Outcome:
     forwarded: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    bounce_halt: bool = False
+    bounce_subjects: list[str] = field(default_factory=list)
 
 
 def load_toml(path: Path) -> dict[str, Any]:
@@ -165,8 +167,9 @@ def open_context(pw: Playwright, tenant: TenantConfig, headless: bool) -> Browse
         # [사이드카] full chromium = MailPlug Next.js SPA 렌더용 (env WEBMAIL_CHANNEL override).
         channel=(os.environ.get("WEBMAIL_CHANNEL", "chromium") or None),
         headless=headless,
-        # KIRAMS reactive UI timing race 방어막 (demo-검증값 800ms, env WEBMAIL_SLOW_MO override).
-        slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "800")),
+        # KIRAMS reactive UI timing race 방어막. 기본 1500ms — 800ms 는 배치에서 첫 건 이동 후
+        # SPA 미정착 상태로 다음 행 잡다 정지하는 race 발생(2026-06-23 실측). env WEBMAIL_SLOW_MO override.
+        slow_mo=int(os.environ.get("WEBMAIL_SLOW_MO", "1500")),
         accept_downloads=True,
         viewport={"width": 1280, "height": 900},
         args=["--no-sandbox", "--disable-dev-shm-usage"],
@@ -413,6 +416,21 @@ def move_to_gmail_folder(page: Page, tenant: TenantConfig, row_idx: int = 0) -> 
     page.wait_for_selector(sel["inbox_marker"], timeout=15_000)
 
 
+_BOUNCE_SUBJECT = re.compile(
+    r"failure notice|mail delivery (failed|subsystem)|undelivered mail|delivery status notification"
+    r"|returned mail|mail delivery failure|반송|배달.*실패|전송.*실패", re.I)
+_BOUNCE_FROM = re.compile(r"mailer-daemon|postmaster|qmail|mail delivery", re.I)
+
+
+def _is_bounce(from_text: str, subject_text: str) -> bool:
+    """반송(bounce)/failure notice 인지 — 전달 대상에서 제외. 552 반송이 만든 노이즈·악순환 차단.
+
+    KIRAMS qmail 은 발송 실패 시 'failure notice'(From: MAILER-DAEMON 류) 를 받은편지함에 남기는데,
+    이를 그대로 forward 하면 Gmail 에 반송 노이즈만 쌓이고 큐가 안 빠진다 → 전달 skip.
+    """
+    return bool(_BOUNCE_SUBJECT.search(subject_text or "") or _BOUNCE_FROM.search(from_text or ""))
+
+
 def process_inbox(page: Page, tenant: TenantConfig,
                   limit: "int | None" = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """받은편지함 = pending queue. 위에서부터 limit(미지정 시 tenant.poll_limit) 건 처리.
@@ -427,6 +445,7 @@ def process_inbox(page: Page, tenant: TenantConfig,
     sel = tenant.selectors
     forwarded: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    bounce_subjects: list[str] = []   # 받은편지함서 만난 failure notice(과거 반송 증거) — 발견 시 작동 중단 신호
 
     _n = limit if limit is not None else tenant.poll_limit
     skip = 0          # 선두에 쌓인 forward-불가(용량초과 등) 메일 수 — 그만큼 아래 행을 처리
@@ -454,6 +473,15 @@ def process_inbox(page: Page, tenant: TenantConfig,
         # forwarded 메타용 식별자는 제목으로 충분 (Telegram 침묵 정책).
         mid = "?"
 
+        # 반송(failure notice) = 과거 전달이 552 등으로 실패했다는 증거(비동기 도착).
+        # 전달하지 않고 받은편지함에 남긴 채 기록 → 이번 run 의 깨끗한 메일은 계속 처리하되,
+        # run 종료 시 report() 가 텔레그램 알림 + 작동 중단(타이머 disable) 신호를 낸다 (Dr. Ben 수동 처리).
+        if _is_bounce(from_text, subject_text):
+            log.info("bounce/failure notice 감지 — 전달 skip, 작동 중단 예정: %s", subject_text or "?")
+            bounce_subjects.append(subject_text or "failure notice")
+            skip += 1
+            continue
+
         try:
             forward_via_webmail(page, tenant, row_idx=skip)
         except OversizeForwardError:
@@ -477,15 +505,34 @@ def process_inbox(page: Page, tenant: TenantConfig,
         forwarded.append({"id": mid, "from": from_text, "subject": subject_text})
         processed += 1
 
-    return forwarded, failures
+    return forwarded, failures, bounce_subjects
 
 
-def notify_telegram(text: str) -> None:
-    """KIRAMS forwarding 알림은 gmail-label-actions 의 Gmail 브리핑에 흡수되므로 별도 Telegram 발송 ✗.
+def notify_telegram(text: str, push: bool = False) -> None:
+    """알림. **기본은 stderr 로그만**(성공·일반 알림은 Telegram 침묵 — 매 회차 spam 방지,
+    gmail-label-actions 의 Gmail 브리핑에 흡수). **push=True 일 때만** Telegram Bot API 직접 발송 —
+    반송(failure notice) 감지처럼 Dr. Ben 의 *즉시 수동 개입* 이 필요한 알림 전용.
 
-    debugging 용으로 stderr 에만 흘려둠 (OpenClaw 의 stdout-Telegram hook 회피).
+    봇토큰은 사이드카에 파일로 마운트하지 않는다(최소권한 유지). 호스트 래퍼(poll.sh)가
+    openclaw.json 에서 읽어 *이 run 에 한해* env 로 주입. 미주입(수동 디버그 등) 시 조용히 로그 fallback.
     """
     log.info("notify: %s", text)
+    if not push:
+        return
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not tok or not chat:
+        return
+    try:
+        import urllib.request
+        import urllib.parse
+        data = urllib.parse.urlencode(
+            {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage", data=data),
+            timeout=15)
+    except Exception as e:
+        log.warning("telegram 발송 실패: %s", type(e).__name__)
 
 
 def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
@@ -534,7 +581,8 @@ def cron_run(tenant: TenantConfig, limit: "int | None" = None) -> Outcome:
                 return outcome
 
         try:
-            outcome.forwarded, outcome.failures = process_inbox(page, tenant, limit=limit)
+            outcome.forwarded, outcome.failures, outcome.bounce_subjects = process_inbox(page, tenant, limit=limit)
+            outcome.bounce_halt = bool(outcome.bounce_subjects)
         except Exception as e:
             log.exception("process_inbox 예외")
             outcome.error = f"process_failed: {type(e).__name__}"
@@ -594,11 +642,20 @@ def report(tenant: TenantConfig, outcome: Outcome) -> int:
         notify_telegram(
             f"📨 {tenant.label} webmail 신규 {len(outcome.forwarded)}건 → forwarding 완료"
         )
+    if outcome.bounce_halt:
+        notify_telegram(
+            f"🛑 {tenant.label} 포워딩 반송(failure notice) {len(outcome.bounce_subjects)}건 감지 — 자동 포워딩 중단.\n"
+            f"Gmail 이 콘텐츠 보안(552)으로 거부한 메일입니다. KIRAMS 받은편지함의 'failure notice' 를 열어\n"
+            f"어떤 메일이 반송됐는지 확인하고, 해당 원본(‘Gmail’ 보관함, 미배달)을 수동 처리하세요.\n"
+            f"처리 + failure notice 삭제 후 → /cron on (또는 사이드카 타이머 재가동)으로 재개.",
+            push=True,   # 반송 알림만 Telegram 푸시 (성공·실패는 log-only)
+        )
+        print("BOUNCE_HALT", flush=True)   # 호스트 래퍼(poll.sh)가 이 마커로 타이머 disable 판단
     if outcome.failures:
         notify_telegram(
             f"⚠ {tenant.label} {len(outcome.failures)}건 forwarding 실패 — 다음 회차 재시도"
         )
-    return 0 if not outcome.failures else 2
+    return 0 if not (outcome.failures or outcome.bounce_halt) else 2
 
 
 def main() -> int:
