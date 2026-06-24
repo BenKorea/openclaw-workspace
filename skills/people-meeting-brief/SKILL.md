@@ -1,7 +1,7 @@
 ---
 name: people-meeting-brief
-description: 미팅이 다가오면 vault(2nd-brain) 의 인맥 노트에서 예상 참석자와 누적 맥락을 자동 추출해 Telegram으로 브리핑. 사람을 캘린더 attendees에 매번 등록하지 않아도, 미팅 자체가 사람을 호출. 설계 단계 — 구현 미착수.
-status: design-only
+description: vault(2nd-brain) 인맥 노트를 기반으로 Telegram 브리핑. Phase 3-A(주간 인맥 감사) 구현 — 매주 금요일 cron 이 검토/보강 대기 인맥을 push. Phase 3-B(미팅 능동 브리핑 — 캘린더 단서로 참석자 맥락 추출)는 미착수.
+status: mvp (Phase 3-A 구현 / 3-B 설계)
 allowed_tools: [bash]
 ---
 
@@ -16,9 +16,19 @@ vault 경로: `~/projects/2nd-brain-vault/knowledge/02_areas/인맥/` (15명 노
 
 ## 상태
 
-**설계 완료 · 구현 미착수.**
+**Phase 3-A (주간 인맥 감사) = 구현 완료** (`run.py`). **Phase 3-B (미팅 능동 브리핑) = 설계만.**
 설계 본체: `~/projects/2nd-brain-vault/knowledge/01_projects/openclaw-people-meeting-brief/README.md`.
-이 파일은 향후 `run.py` 가 채택할 동작 정책을 미리 못 박아 두는 용도.
+
+### Phase 3-A — 주간 인맥 감사 브리핑 (`run.py`)
+
+매주 금요일 14:00 cron 이 발화 → vault(읽기전용 마운트) 인맥 노트 scan → **검토/보강 대기 항목만** Telegram push.
+
+- **입력**: vault `knowledge/02_areas/인맥/*.md` frontmatter (브레인화 `audit --inmaek-only` 와 같은 신호 — `gcontacts_review: flagged` + 동기 미완 노트). brainify.py 는 호스트 skill 이라 컨테이너에서 못 보므로 `run.py` 가 로직 자족 포팅 (vault 만 ro 로 읽음, 쓰기 없음).
+- **출력**: 🔵 검토 대기(자동 생성 → 승격/폐기) + 🟡 보강 필요(부서·보직 미입력 미동기). **둘 다 없으면 stdout 비움 = 발송 안 함**(gws-assistant 규칙).
+- **마운트**: 컨테이너 `VAULT_ROOT=/vault` (extra.yml `…/2nd-brain-vault:/vault:ro`). 호스트 테스트는 `VAULT_ROOT=~/projects/2nd-brain-vault python3 run.py`.
+- **cron**: `0 14 * * 5 @ Asia/Seoul`, deliver `telegram` announce (별도 잡 `inmaek-weekly-brief`, 독립 토글). `gmail-weekly-report`(같은 시각)와 분리.
+
+> ⚠️ 미구현 선행조건: ① extra.yml vault ro 마운트 + 컨테이너 재생성(kimbi·ai4lt 각각, EXTRA_MOUNTS 인증), ② cron 등록(`cron list --all` 중복확인·SQLite). → 핸드오프로 OpenClaw 런타임 단계 진행.
 
 ## 향후 절차 (구현 후 적용 예정)
 
