@@ -32,8 +32,16 @@
 종결(commit point):
   - terminal(1·2·3·6): 모든 필수 액션 성공 후에만 라벨 "9 완료" 부착 + 원라벨 제거.
     필수 액션 실패(예: 일시 추출 실패) → 라벨 유지, 다음 사이클 재시도.
-  - 회신(4·5·7·8): 초안 생성까지 완결, 라벨은 유지(비-terminal). 실발송 감지→자동
-    "9 완료" 승급은 **Phase 2**(awaiting_reply 영속큐 + sent-poll). 지금은 초안만.
+  - 회신(4·5·7·8): 초안 생성까지 완결, 라벨은 유지. **sent-poll 레인(Phase 2, 구현됨)**이
+    실발송을 감지해 자동 "9 완료" 승급.
+
+sent-poll 레인 (Phase 2 — 발신 반영. 캡처된 사안의 스레드 완전성이 목표):
+  - `in:sent newer_than:<창>` 폴링 → 발신이 낀 스레드 중 (a) 캡처 폴더가 이미 있으면
+    재캡처(멱등 — message_count 변동 시만 덮어쓰기, _actions.json 보존) → 캡처 후
+    내 회신이 _thread.md 에 반영됨. (b) 회신형 라벨이 붙어 있고 마지막 메시지가 나(SELF)면
+    → 회신 발송으로 보고 라벨 제거 + "9 완료" 부착(자동 종결).
+  - 미캡처·무라벨 발신 스레드는 **보고만**(자동 캡처 ✗ — 선별 원칙. 편입은 발신 메일에
+    라벨을 붙이거나 brainify 지시로). 한계: Gmail 발신만 봄 — KIRAMS 웹메일 발신은 범위 밖.
 
 사용:
   GMAIL_ROUTER_ACCOUNT=you@gmail.com python3 run.py            # 전체 실행
@@ -43,6 +51,8 @@
 환경변수:
   GMAIL_ROUTER_ACCOUNT  gog 계정 (필수 — 본인 Gmail 계정. 기본값 없음: 누출 방지)
   GMAIL_ROUTER_INBOX    캡처 저장 위치 (기본: ~/.openclaw/workspace/attachments)
+  GMAIL_SENT_POLL       sent-poll 레인 스위치 (기본 on, "off" 로 비활성)
+  GMAIL_SENT_WINDOW     sent 검색 창 (기본 "2d" — cron 주기 대비 넉넉히)
 
 전제:
   - gog CLI 설치 + 해당 계정 인증 (Gmail·Calendar·Tasks scope).
@@ -76,6 +86,9 @@ INBOX = pathlib.Path(os.path.expanduser(
 DONE_LABEL = "9 완료"          # 터미널 표식 (고정 규칙)
 GTASK_LIST_NAMES = ("Brainify", "메일 후속")  # 우선순위 — 기존 list 재사용
 MAX = 8                         # 라벨당 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
+SENT_POLL = os.environ.get("GMAIL_SENT_POLL", "on").strip().lower() != "off"
+SENT_WINDOW = os.environ.get("GMAIL_SENT_WINDOW", "2d").strip() or "2d"
+SENT_MAX = 25                   # sent-poll 1회 검색 상한 (창 2d 기준 여유)
 STAGING = pathlib.Path("/tmp/gmail-label-actions")
 CLAUDE_MODEL = "claude-opus-4-7"
 
@@ -860,6 +873,69 @@ def drain_label(label: str, actions: tuple[str, ...], terminal: bool,
     return (n_ok, n_skip, n_pend)
 
 
+def _latest_from_self(thread: dict) -> bool:
+    """스레드 마지막 메시지 발신자가 본인(SELF)인가 — 회신 발송 감지의 근거."""
+    msgs = sorted(thread.get("messages", []), key=lambda m: int(m.get("internalDate", "0") or 0))
+    if not msgs:
+        return False
+    frm = _headers(msgs[-1].get("payload", {})).get("from", "")
+    return any(a and a.lower() in SELF for _, a in getaddresses([frm]))
+
+
+def drain_sent(dry: bool) -> tuple[int, int, int]:
+    """sent-poll 레인 (Phase 2): 발신 반영 재캡처 + 회신형 라벨 자동 종결.
+    → (재캡처 n, 종결승급 n, 미캡처 보고 n). 목표 = '캡처된 사안의 스레드 완전성'
+    (모든 발신 보관이 아님 — 미캡처·무라벨 발신은 보고만, 선별은 사람)."""
+    res = gog_json("gmail", "search", f"in:sent newer_than:{SENT_WINDOW}", "--max", str(SENT_MAX))
+    if not isinstance(res, list):
+        print("  ✋ sent 검색 실패 (인증·네트워크).")
+        return (0, 0, 0)
+    tids: list[str] = []
+    snip: dict[str, str] = {}
+    for m in res:
+        tid = m.get("threadId") or m.get("id")
+        if tid and tid not in tids:
+            tids.append(tid)
+            snip[tid] = str(m.get("snippet") or m.get("subject") or "").strip()[:60]
+    if dry:
+        print(f"  · sent-poll  발신 스레드 {len(tids)}건 (창 {SENT_WINDOW})")
+        return (0, 0, 0)
+    if not tids:
+        return (0, 0, 0)
+
+    reply_tids: dict[str, str] = {}          # tid → 붙어 있는 회신형 라벨명
+    for label, _a, terminal in LABELS:
+        if terminal:
+            continue
+        ltids, _ = search_threads(label)
+        for t in ltids or []:
+            reply_tids.setdefault(t, label)
+
+    n_re = n_done = n_seen = 0
+    for tid in tids:
+        existing, _prev_mc = find_existing_capture(tid)
+        if existing is None and tid not in reply_tids:
+            n_seen += 1
+            print(f"  👀 [sent] 미캡처 발신 스레드(보고만): {tid}  {snip.get(tid, '')}")
+            continue
+        ok, msg, _saved, _folder, thread = process_thread(tid)
+        if not ok:
+            print(f"  ↷ [sent] {tid} 재캡처 실패 — {msg}")
+            continue
+        if "skip" not in msg:
+            n_re += 1
+            print(f"  🔁 [sent] {tid} 발신 반영 재캡처 — {msg}")
+        label = reply_tids.get(tid)
+        if label and _latest_from_self(thread):
+            rok, rerr = gog_call("gmail", "labels", "modify", tid, "--add", DONE_LABEL, "--remove", label)
+            if rok:
+                n_done += 1
+                print(f"  ✅ [sent] {tid} 회신 발송 감지 → '{label}' 종결('{DONE_LABEL}')")
+            else:
+                print(f"  ⚠️ [sent] {tid} 종결 라벨변경 실패: {rerr}")
+    return (n_re, n_done, n_seen)
+
+
 def main() -> None:
     if not ACCOUNT:
         print("✋ 환경변수 GMAIL_ROUTER_ACCOUNT 가 비어 있습니다.\n"
@@ -886,9 +962,17 @@ def main() -> None:
         tot_skip += skip
         tot_pend += pend
 
+    s_re = s_done = s_seen = 0
+    if SENT_POLL and (only is None or only == "sent"):
+        print("  — sent-poll (발신 반영, Phase 2) —")
+        s_re, s_done, s_seen = drain_sent(dry)
+
     if not dry:
         tail = f" / 초안 검토대기 {tot_pend}" if tot_pend else ""
-        print(f"🎉 완료: 처리 {tot_ok} / 건너뜀 {tot_skip}{tail}")
+        sent_tail = ""
+        if s_re or s_done or s_seen:
+            sent_tail = f" / sent: 재캡처 {s_re}·종결 {s_done}·보고 {s_seen}"
+        print(f"🎉 완료: 처리 {tot_ok} / 건너뜀 {tot_skip}{tail}{sent_tail}")
 
 
 if __name__ == "__main__":
