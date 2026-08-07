@@ -68,14 +68,14 @@ def main() -> None:
     review, incomplete = scan()
     if not review and not incomplete:
         return  # 빈 stdout → 발송 안 함
-    lines = ["📇 주간 인맥 브리핑"]
+    lines = ["주간 인맥 브리핑"]
     if review:
-        lines.append(f"\n🔵 검토 대기 (자동 생성 {len(review)}건) — 승격/폐기 결정:")
-        lines += [f"  • {n}" for n in review]
+        lines.append(f"\n검토 대기 (자동 생성 {len(review)}건) - 승격/폐기 결정:")
+        lines += [f"  - {n}" for n in review]
     if incomplete:
-        lines.append(f"\n🟡 보강 필요 ({len(incomplete)}건) — 부서·보직 미입력으로 미동기:")
-        lines += [f"  • {n}" for n in incomplete]
-    lines.append("\n→ Claude Code 에서 `/brainify audit` 또는 인맥 노트 보강 후 동기.")
+        lines.append(f"\n보강 필요 ({len(incomplete)}건) - 부서·보직 미입력으로 미동기:")
+        lines += [f"  - {n}" for n in incomplete]
+    lines.append("\n-> Claude Code 에서 `/brainify audit` 또는 인맥 노트 보강 후 동기.")
     print("\n".join(lines))
 
 
