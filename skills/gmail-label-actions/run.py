@@ -65,6 +65,8 @@ Gmail 에 이 9개 라벨을 그대로 만들어 사용하세요. 자세한 적�
 from __future__ import annotations
 import base64
 import datetime
+import difflib
+import html
 import json
 import os
 import pathlib
@@ -617,21 +619,61 @@ def process_thread(tid: str) -> tuple[bool, str, list[str], pathlib.Path | None,
 
 
 # ── 추출 (claude --print) ───────────────────────────────────────────────────
+_HTML_SKIP_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"[ \t]+")
+_BLANKLINES_RE = re.compile(r"\n{3,}")
+
+
+def _strip_html_noise(text: str) -> str:
+    """HTML 원문(_thread.md 가 text/plain 없을 때 raw HTML 그대로 저장)에서 태그·
+    인라인 style 잡음을 걷어낸다. 2026-09-04 실측: 항공권/호텔 예약확인 메일처럼
+    표 하나마다 인라인 style 이 수백 byte 씩 붙는 HTML 은, 원문을 그대로 앞에서부터
+    자르면(_thread_text 의 문자수 캡) 실제 여정 정보(구간2·체크아웃 등)에 닿기도
+    전에 예산이 바닥나 모델이 날짜를 잘못 짚거나 아예 못 찾는다. 태그를 먼저 벗겨
+    같은 문자 예산으로 훨씬 많은 실제 내용이 들어가게 한다."""
+    if "<" not in text or ">" not in text:
+        return text                          # 이미 plain text — 손댈 이유 없음
+    text = _HTML_SKIP_RE.sub(" ", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = _WS_RE.sub(" ", text)
+    text = _BLANKLINES_RE.sub("\n\n", text)
+    return text.strip()
+
+
 def _thread_text(folder: pathlib.Path) -> str:
     try:
-        return (folder / "_thread.md").read_text(encoding="utf-8")[:6000]
+        raw = (folder / "_thread.md").read_text(encoding="utf-8")
+        return _strip_html_noise(raw)[:6000]
     except Exception:
         return ""
 
 
 def extract_schedule(folder: pathlib.Path, H: dict, now: datetime.datetime) -> dict | None:
-    """메일에서 캘린더 이벤트 1개 추출(Opus). 명확한 시작 일시 없으면 None."""
+    """메일에서 캘린더 이벤트 1개 추출(Opus). 명확한 시작 일시 없으면 None.
+
+    ★ 예약/구매확인 메일 함정 (2026-09-04 실측): 항공권·호텔 예약확인 메일 하나에
+    '예약일자(발송/구매 시각)'와 '실제 탑승·체크인 일시(여정)' 두 종류 날짜가 함께
+    나온다. 이 둘을 구분하라는 지시가 없으면 모델이 예약일자를 이벤트 시작으로
+    잘못 뽑는다(예: 9/4 예약 접수한 10/29 출발 항공편이 캘린더에 9/4로 등록됨).
+    아래 프롬프트가 이를 명시적으로 갈라 지시한다."""
     prompt = (
         f"오늘 날짜: {now.date().isoformat()} (KST, +09:00)\n\n"
         "다음 메일에서 캘린더 이벤트 1개를 추출하라. 명확한 시작 일시가 있어야 함.\n"
+        "- 이 메일이 예약확인/구매영수증(항공권·기차·호텔·공연 등)이면, 이벤트 시작일시는 "
+        "반드시 **실제 이용 일시**(탑승·출발·체크인·공연 시각)를 써야 한다 — 메일에 함께 적힌 "
+        "'예약일자'·'구매일자'·'발송일'(=메일이 발송/구매된 시점, 대개 오늘 날짜와 가까움)은 "
+        "이벤트 시작일시로 쓰지 말 것. 두 날짜가 다르면 이용 일시가 항상 우선.\n"
+        "- 왕복/복수 구간(예: 왕복 항공권)이면 **가장 이른 구간**(출발일 기준 최초) 하나만 "
+        "추출하고, summary 끝에 '(왕복/복수구간 — 나머지 구간 별도 확인 필요)'를 덧붙여라 — "
+        "이 함수는 이벤트를 1개만 반환하므로 나머지 구간은 자동 등록되지 않는다.\n"
         "- 시작·종료 모두 시간 포함이면 RFC3339 (예: '2026-05-15T14:00:00+09:00').\n"
         "- 시작만 있고 종료 없음 → 종료 = 시작 + 1시간.\n"
         "- 시간 없이 날짜만 → all_day=true, start/end='YYYY-MM-DD'.\n"
+        "- all_day 인 경우 end 는 EXCLUSIVE(체크아웃 등 마지막 날 다음날)다 — 예: "
+        "10/29 체크인·10/31 체크아웃(2박)이면 start='2026-10-29', end='2026-10-31'"
+        "(end='2026-11-01' 아님 — 흔한 오프바이원 실수).\n"
         "- 명확한 일시 없거나 모호하면 {\"event\": null}.\n"
         "- summary 는 한국어 한 줄. location 은 본문에 명시된 경우만.\n"
         "응답은 JSON 객체 한 줄만. 코드블록·해설 금지.\n"
@@ -730,8 +772,89 @@ def create_task(title: str, notes: str, due: str | None) -> str | None:
     return out["id"] if isinstance(out, dict) and out.get("id") else None
 
 
-def create_calendar_event(ev: dict, tid: str) -> str | None:
-    """primary 캘린더에 이벤트 생성 → event_id. all-day 종료는 +1(Google EXCLUSIVE 보정)."""
+# ── 캘린더 중복 검사 (2026-09-04 신설) ──────────────────────────────────────
+# 서로 다른 Gmail 스레드(최초 초청메일 + 이후 확정메일 등)가 같은 실제 일정을
+# 가리키는 경우, run_actions() 의 _actions.json 멱등성(스레드 범위)은 이를 못 잡는다
+# — vault 전체 dedup 은 brainify 몫이라 문서화돼 있었지만 캘린더는 그 범위 밖에 있었다.
+# 여기서 "같은 날짜에 제목이 비슷한 기존 이벤트"를 찾아, 확실하면 자동 병합(새로
+# 만들지 않고 기존 이벤트에 설명만 덧붙임), 애매하면 새로 만들되 이벤트 설명에
+# 경고 한 줄을 남겨 Dr. Ben 이 캘린더를 열어볼 때 바로 보이게 한다. 무인 실행(cron)
+# 에서도 안전 — 물어보지 않고 결정하되, 애매한 판단은 삭제·비가역이 아니라
+# "설명에 한 줄 추가"로만 남긴다.
+CAL_MERGE_THRESHOLD = 0.72   # 이 이상 유사 → 자동 병합(새 이벤트 생성 안 함)
+CAL_FLAG_THRESHOLD = 0.40    # 이 이상(병합 미만) → 새로 만들되 설명에 경고 추가
+
+_TITLE_NOISE_RE = re.compile(
+    r"[\[\(【][^\]\)】]*[\]\)】]|안내|공지|알림|재공지|\(수정[^)]*\)|요청|말씀드립니다"
+)
+
+
+def _norm_title(s: str) -> str:
+    """제목 비교용 정규화 — 대괄호 태그·흔한 잡음 단어 제거, 공백 접기, casefold."""
+    s = _TITLE_NOISE_RE.sub(" ", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.casefold()
+
+
+def find_similar_event(ev: dict) -> tuple[dict, float] | None:
+    """같은 날짜(전날~다음날, all-day 시차 보정)에서 제목이 가장 비슷한 기존 이벤트.
+    반환 (event_dict, similarity) 또는 후보가 아예 없으면 None. 실패(gog 오류)도 None —
+    중복검사 실패로 일정 생성 자체를 막지 않는다(가용성 우선)."""
+    day = ev["start"][:10]
+    try:
+        lo = (datetime.date.fromisoformat(day) - datetime.timedelta(days=1)).isoformat()
+        hi = (datetime.date.fromisoformat(day) + datetime.timedelta(days=2)).isoformat()
+    except (ValueError, TypeError):
+        return None
+    cands = gog_json("calendar", "events", "primary", "--from", lo, "--to", hi, "--max", "50")
+    if not isinstance(cands, list) or not cands:
+        return None
+    target = _norm_title(ev.get("summary") or "")
+    if not target:
+        return None
+    best, best_ratio = None, 0.0
+    for c in cands:
+        if not isinstance(c, dict) or c.get("status") == "cancelled":
+            continue
+        cand_title = _norm_title(c.get("summary") or "")
+        if not cand_title:
+            continue
+        ratio = difflib.SequenceMatcher(None, target, cand_title).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = c, ratio
+    if best is None or best_ratio < CAL_FLAG_THRESHOLD:
+        return None
+    return (best, best_ratio)
+
+
+def _merge_into_existing(existing: dict, ev: dict, tid: str) -> str | None:
+    """기존 이벤트 설명에 이번 Gmail 스레드 링크를 덧붙인다(새 이벤트 생성 안 함).
+    성공 시 기존 이벤트 id 반환, 실패 시 None(호출자가 새로 생성하는 쪽으로 폴백)."""
+    eid = existing.get("id")
+    if not eid:
+        return None
+    old_desc = existing.get("description") or ""
+    add = f"Gmail thread(병합됨): https://mail.google.com/mail/u/0/#all/{tid}"
+    if add in old_desc:          # 이미 같은 스레드가 병합돼 있으면 재추가 안 함(멱등)
+        return eid
+    new_desc = f"{old_desc}\n\n{add}" if old_desc else add
+    ok, _ = gog_call("calendar", "update", "primary", eid, "--description", new_desc)
+    return eid if ok else None
+
+
+def create_calendar_event(ev: dict, tid: str) -> tuple[str | None, str]:
+    """primary 캘린더에 이벤트 생성 → (event_id, status). all-day 종료는 +1(Google
+    EXCLUSIVE 보정). status ∈ {"created","merged","flagged","error"} — 호출자가
+    보고 문구를 status 로 구분한다."""
+    similar = find_similar_event(ev)
+    if similar is not None:
+        cand, ratio = similar
+        if ratio >= CAL_MERGE_THRESHOLD:
+            eid = _merge_into_existing(cand, ev, tid)
+            if eid:
+                return (eid, "merged")
+            # 병합 실패(update 오류 등) — 새로 만드는 쪽으로 폴백, 아래에서 flagged 처리되게 둔다.
+
     start, end = ev["start"], (ev.get("end") or ev["start"])
     if ev.get("all_day"):
         try:
@@ -739,6 +862,13 @@ def create_calendar_event(ev: dict, tid: str) -> str | None:
         except (ValueError, TypeError):
             pass
     desc = f"Gmail thread: https://mail.google.com/mail/u/0/#all/{tid}"
+    status = "created"
+    if similar is not None:
+        cand, ratio = similar
+        desc = (f"⚠️ 유사 일정 있을 수 있음(유사도 {ratio:.2f}) — 확인: "
+                 f"\"{cand.get('summary','')}\" {cand.get('start',{}).get('dateTime') or cand.get('start',{}).get('date','')} "
+                 f"{cand.get('htmlLink','')}\n\n{desc}")
+        status = "flagged"
     args = ["calendar", "create", "primary", "--summary", ev.get("summary") or "(제목 없음)",
             "--from", start, "--to", end, "--description", desc]
     if ev.get("location"):
@@ -746,7 +876,8 @@ def create_calendar_event(ev: dict, tid: str) -> str | None:
     if ev.get("all_day"):
         args.append("--all-day")
     out = gog_json(*args)
-    return out["id"] if isinstance(out, dict) and out.get("id") else None
+    eid = out["id"] if isinstance(out, dict) and out.get("id") else None
+    return (eid, status if eid else "error")
 
 
 def create_draft(reply_msg_id: str, reply_to: str, subject: str, body: str) -> str | None:
@@ -802,11 +933,13 @@ def run_actions(actions: tuple[str, ...], folder: pathlib.Path, thread: dict,
             ev = extract_schedule(folder, H, now)
             if not ev:                       # 일시 추출 실패 → 필수인데 실패 → bail
                 return (False, notes + ["일시 추출 실패(라벨 유지·재시도)"], reply_pending)
-            eid = create_calendar_event(ev, tid)
+            eid, cal_status = create_calendar_event(ev, tid)
             if not eid:
                 return (False, notes + ["calendar 생성 실패"], reply_pending)
             _write_action(folder, "calendar_event_id", eid)
-            notes.append(f"일정✓({ev['summary'][:20]})")
+            cal_tag = {"created": "일정✓", "merged": "일정=병합(기존이벤트)",
+                      "flagged": "일정✓(유사일정있음⚠)"}.get(cal_status, "일정✓")
+            notes.append(f"{cal_tag}({ev['summary'][:20]})")
 
         elif act == "reply":
             if done.get("gmail_draft_id"):
