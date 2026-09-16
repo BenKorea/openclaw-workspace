@@ -85,6 +85,10 @@ ACCOUNT = os.environ.get("GMAIL_ROUTER_ACCOUNT", "").strip()  # 필수 (기본�
 SELF = {ACCOUNT.lower()} | {a.strip().lower() for a in os.environ.get("GMAIL_SELF_ADDRESSES", "").split(",") if a.strip()}
 INBOX = pathlib.Path(os.path.expanduser(
     os.environ.get("GMAIL_ROUTER_INBOX", "~/.openclaw/workspace/attachments")))
+# INBOX = <vault>/sources/00_inbox 이므로 두 단계 위가 vault root. 컨테이너는 이 경로 밖(/vault)이
+# 읽기전용이라(docker inspect 실측, 2026-09-16) 쓰기는 절대 여기 밖으로 안 나간다 — 아래는 grep(읽기)뿐.
+VAULT_ROOT = INBOX.parent.parent
+KNOWLEDGE = VAULT_ROOT / "knowledge"
 DONE_LABEL = "9 완료"          # 터미널 표식 (고정 규칙)
 GTASK_LIST_NAMES = ("Brainify", "메일 후속")  # 우선순위 — 기존 list 재사용
 MAX = 8                         # 라벨당 1회 드레인 상한 (멱등 — 잔여분 다음 사이클)
@@ -505,6 +509,25 @@ def find_existing_capture(tid: str) -> tuple:
     return (None, None)
 
 
+def _already_filed(tid: str) -> bool:
+    """이 threadId 가 knowledge/ 어딘가(04_archive 포함)에 이미 편입돼 있는가 — vault-wide, 읽기전용.
+
+    find_existing_capture() 는 INBOX 안만 본다. 그래서 이미 archive 된 스레드에 라벨이
+    (액션 실패로) 안 떨어진 채 남아있으면, 매 사이클 "기존 캡처 없음"으로 오판해 INBOX 에
+    새 폴더를 또 만들고, brain-drain 이 내용 중복으로 지우고, 다음 사이클에 또 만드는
+    무한루프가 된다(2026-09-16 실측: Nonprostatic 미니심포지엄 스레드가 `2 일정` 라벨
+    미해제로 30분마다 재생성됨 — 9/8에 이미 04_archive 로 편입 완료된 건이었다).
+    """
+    if not tid or not KNOWLEDGE.exists():
+        return False
+    try:
+        r = subprocess.run(["grep", "-rl", tid, str(KNOWLEDGE)],
+                           capture_output=True, text=True, timeout=30)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
 # ── 액션 멱등 사이드카 (_actions.json — 캡처와 독립, 덮어쓰기에 안전) ──────────
 def _read_actions(folder: pathlib.Path) -> dict:
     try:
@@ -574,6 +597,13 @@ def process_thread(tid: str) -> tuple[bool, str, list[str], pathlib.Path | None,
     thread = result.get("thread", {}) if isinstance(result, dict) else {}
     cur_mc = len(thread.get("messages", []))
     existing, prev_mc = find_existing_capture(tid)
+
+    # INBOX 엔 없지만 knowledge/ 에 이미 편입돼 있으면(라벨만 안 떨어진 상태) — 재캡처하지 않는다.
+    # folder=None 이라 호출자는 액션을 못 돌리고 라벨을 유지하지만(현재 동작과 동일), 최소한
+    # INBOX 에 중복을 새로 안 만들어 brain-drain 과의 생성-삭제 무한루프를 끊는다.
+    if existing is None and _already_filed(tid):
+        return (False, "이미 편입됨(archive) — 재캡처 skip. 라벨 액션이 계속 실패 중이면 "
+                        "수동으로 라벨을 확인·제거해야 할 수 있음", [], None, thread)
 
     if existing is not None and prev_mc is not None and prev_mc == cur_mc:
         files = [p.name for p in existing.iterdir() if p.is_file()]
