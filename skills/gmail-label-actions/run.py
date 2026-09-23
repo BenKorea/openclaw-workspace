@@ -85,9 +85,15 @@ ACCOUNT = os.environ.get("GMAIL_ROUTER_ACCOUNT", "").strip()  # 필수 (기본�
 SELF = {ACCOUNT.lower()} | {a.strip().lower() for a in os.environ.get("GMAIL_SELF_ADDRESSES", "").split(",") if a.strip()}
 INBOX = pathlib.Path(os.path.expanduser(
     os.environ.get("GMAIL_ROUTER_INBOX", "~/.openclaw/workspace/attachments")))
-# INBOX = <vault>/sources/00_inbox 이므로 두 단계 위가 vault root. 컨테이너는 이 경로 밖(/vault)이
-# 읽기전용이라(docker inspect 실측, 2026-09-16) 쓰기는 절대 여기 밖으로 안 나간다 — 아래는 grep(읽기)뿐.
-VAULT_ROOT = INBOX.parent.parent
+# INBOX = <vault>/sources/00_inbox 이므로 두 단계 위가 vault root — 단, 이 산수는 INBOX 가 vault
+# 안에 중첩 마운트됐을 때만 맞다. 현재 openclaw-docker 구성은 /inbox 를 컨테이너 루트에 *독립*
+# 마운트하므로(vault 전체는 별도로 /vault:ro) INBOX.parent.parent 가 '/' 가 되어 KNOWLEDGE 가
+# 존재하지 않는 '/knowledge' 로 계산됐다 — _already_filed() 가 항상 조용히 False 를 반환해
+# "이미 archive된 스레드 재캡처 무한루프 수리"(2026-09-16 커밋)가 이 컨테이너에서는 한 번도
+# 작동한 적이 없었다(2026-09-23 실측: /knowledge 없음·/vault/knowledge 는 정상 존재, 재캡처 3건 확인).
+# /vault 가 존재하면 그쪽을 우선한다 — 새 마운트·env 추가 없이 기존 read-only 마운트를 그대로 쓴다.
+_derived_root = INBOX.parent.parent
+VAULT_ROOT = pathlib.Path("/vault") if (pathlib.Path("/vault") / "knowledge").exists() else _derived_root
 KNOWLEDGE = VAULT_ROOT / "knowledge"
 DONE_LABEL = "9 완료"          # 터미널 표식 (고정 규칙)
 GTASK_LIST_NAMES = ("Brainify", "메일 후속")  # 우선순위 — 기존 list 재사용
