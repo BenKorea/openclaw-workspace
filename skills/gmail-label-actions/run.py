@@ -534,6 +534,27 @@ def _already_filed(tid: str) -> bool:
         return False
 
 
+ALREADY_FILED = "이미 편입됨(archive)"   # process_thread 의 msg 접두 — 호출자가 분기하는 표식
+
+
+def _filed_folder(tid: str) -> pathlib.Path | None:
+    """편입 완료된 캡처 폴더(sources/<para>/<name>/ 의 _thread.md 가 이 threadId) — 읽기전용 탐색.
+    INBOX 밖이라 쓰기는 보장되지 않는다(컨테이너는 /vault:ro) — _write_action 이 실패를 삼킨다."""
+    src = VAULT_ROOT / "sources"
+    if not tid or not src.exists():
+        return None
+    try:
+        r = subprocess.run(["grep", "-rl", "--include=_thread.md", f"gmail_thread_id: {tid}", str(src)],
+                           capture_output=True, text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            p = pathlib.Path(line.strip())
+            if p.is_file() and INBOX not in p.parents:
+                return p.parent
+    except Exception:
+        pass
+    return None
+
+
 # ── 액션 멱등 사이드카 (_actions.json — 캡처와 독립, 덮어쓰기에 안전) ──────────
 def _read_actions(folder: pathlib.Path) -> dict:
     try:
@@ -545,7 +566,12 @@ def _read_actions(folder: pathlib.Path) -> dict:
 def _write_action(folder: pathlib.Path, key: str, value: str) -> None:
     d = _read_actions(folder)
     d[key] = value
-    (folder / "_actions.json").write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        (folder / "_actions.json").write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        # 편입 완료 폴더(/vault:ro)에서는 사이드카를 못 쓴다. 터미널 라벨은 액션 성공 직후 라벨이
+        # 바뀌어 재시도가 없으므로 멱등 마커 부재가 중복을 만들지 않는다 — 경고만 남긴다.
+        print(f"  ⚠️ _actions.json 기록 실패({folder.name}): {e}")
 
 
 # ── 잡첨부 필터 (inline 이미지·TNEF 봉투 제거 — 2026-06-07) ────────────────────
@@ -605,11 +631,13 @@ def process_thread(tid: str) -> tuple[bool, str, list[str], pathlib.Path | None,
     existing, prev_mc = find_existing_capture(tid)
 
     # INBOX 엔 없지만 knowledge/ 에 이미 편입돼 있으면(라벨만 안 떨어진 상태) — 재캡처하지 않는다.
-    # folder=None 이라 호출자는 액션을 못 돌리고 라벨을 유지하지만(현재 동작과 동일), 최소한
-    # INBOX 에 중복을 새로 안 만들어 brain-drain 과의 생성-삭제 무한루프를 끊는다.
+    # ok=True 로 돌려주고 msg 를 ALREADY_FILED 로 표시 — 호출자(drain_label/drain_sent)가 캡처
+    # 없이 액션·라벨 종결만 수행한다. 예전엔 ok=False 라 호출자가 라벨 교체 전에 빠져나가
+    # 같은 스레드가 매 사이클 "건너뜀"으로 영구 반복됐다(2026-10-17 실측 9건, 브레인화는 모두 완료).
     if existing is None and _already_filed(tid):
-        return (False, "이미 편입됨(archive) — 재캡처 skip. 라벨 액션이 계속 실패 중이면 "
-                        "수동으로 라벨을 확인·제거해야 할 수 있음", [], None, thread)
+        filed = _filed_folder(tid)
+        files = [p.name for p in filed.iterdir() if p.is_file()] if filed else []
+        return (True, f"{ALREADY_FILED} — 재캡처 skip", files, filed, thread)
 
     if existing is not None and prev_mc is not None and prev_mc == cur_mc:
         files = [p.name for p in existing.iterdir() if p.is_file()]
@@ -1015,6 +1043,34 @@ def drain_label(label: str, actions: tuple[str, ...], terminal: bool,
     n_ok = n_skip = n_pend = 0
     for tid in tids:
         ok, msg, saved, folder, thread = process_thread(tid)
+
+        if ok and msg.startswith(ALREADY_FILED):
+            # 브레인화는 끝난 스레드 — 캡처 없이 종결만. 회신형은 라벨을 유지하고(발송 감지는
+            # sent-poll 담당) 액션도 돌리지 않는다: 편입 폴더가 ro 면 초안 마커를 못 남겨 30분마다
+            # 초안이 중복 생성되기 때문. 터미널형은 액션(있으면) 후 즉시 '9 완료' 교체 → 재시도 없음.
+            if not terminal:
+                n_skip += 1
+                print(f"  ↷ [{label}] {tid} {msg} — 회신 대기(발송 시 sent-poll 이 종결)")
+                continue
+            anotes: list[str] = []
+            if actions and folder is not None:
+                aok, anotes, _p = run_actions(actions, folder, thread, tid, now)
+                if not aok:
+                    n_skip += 1
+                    print(f"  ⚠️ [{label}] {tid} {msg} — 액션 미완, 라벨 유지  [{' '.join(anotes)}]")
+                    continue
+            elif actions:
+                anotes = ["액션 미실행(편입 폴더 미발견)"]
+            rok, rerr = gog_call("gmail", "labels", "modify", tid, "--add", DONE_LABEL, "--remove", label)
+            if not rok:
+                n_skip += 1
+                print(f"  ⚠️ [{label}] {tid} {msg} — 라벨변경 실패: {rerr}")
+                continue
+            n_ok += 1
+            suffix = f"  [{' '.join(anotes)}]" if anotes else ""
+            print(f"  ✅ [{label}] {tid} {msg} → '{DONE_LABEL}'{suffix}")
+            continue
+
         if not ok or folder is None:
             n_skip += 1
             print(f"  ↷ [{label}] {tid} 캡처 실패 — {msg} (라벨 유지)")

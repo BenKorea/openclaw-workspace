@@ -46,6 +46,7 @@ Gmail 라벨이 뜻하는 **다음 행동**({일정,할일,회신} 멱집합 + �
 - **잡첨부 필터** (2026-06-07): 첨부 저장 시 노이즈 제거. **inline 이미지**(image/* + Content-Disposition:inline 또는 Content-ID; 또는 이름 `image\d+\.(png|gif|jpg)`) = **완전 삭제**. **TNEF 봉투**(`application/ms-tnef`·`winmail.dat`·매직 `78 9f 3e 22`) = **내부 실첨부가 추출됐을 때만 삭제**(봉투가 유일 원본이면 보존). 판별은 thread payload parts 메타(`--full` 로 이미 받음) + 파일 매직. 결정형·무판단. 서명 로고·중복 봉투가 sources 에 안 들어옴.
 - **판단 분리**: PARA 분류·요약·`[[링크]]` 같은 열린 판단은 이 라우터가 하지 않는다 — brainify(Claude Code 스킬)가 나중에. 이 라우터는 knowledge/ 노트를 만들지 않는다.
 - **fail-safe**: terminal 라벨(1·2·3·6)은 필수 액션 *전부 성공* 후에만 `9 완료` 부착. 일시 추출 실패 등은 라벨 유지 → 다음 사이클 재시도(유실 0).
+- **이미 편입된 스레드(2026-10-17)**: INBOX 엔 없고 knowledge/ 에 노트가 있는 스레드(브레인화 완료 후 라벨만 남은 상태)는 재캡처하지 않고 **종결만** 한다 — terminal 라벨은 액션(편입 폴더의 `_thread.md` 기준, 있으면) 후 즉시 `9 완료`, 회신형은 라벨 유지(발송 시 sent-poll 이 종결). 예전엔 이 경우를 "캡처 실패"로 취급해 라벨 교체 전에 빠져나가 매 사이클 "건너뜀 N건"이 영구 반복됐다(실측 9건·브레인화는 모두 완료 상태).
 - **멱등성 2층**: 캡처 = `_thread.md` 의 `gmail_thread_id`+`message_count`. GWS 액션 = 스레드 폴더 `_actions.json` 사이드카(`calendar_event_id`/`google_task_id`/`gmail_draft_id`) — 캡처가 `_thread.md` 를 덮어써도 마커 보존 → 이중 생성 0.
 - **회신 생애주기 (Phase 2 완결)**: 초안 생성(라벨 유지) → Dr. Ben 검토·발송 → sent-poll 이 발송 감지 → 재캡처 + 자동 `9 완료`. 한계: **Gmail 발신만** 감지 — KIRAMS 웹메일 발신은 범위 밖(그 사안은 self-forward 관행으로 보완).
 
